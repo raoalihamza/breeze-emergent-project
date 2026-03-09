@@ -1,0 +1,200 @@
+.atom-container-refined {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: flex-start;
+  width: 100%;
+  height: 100%;
+  padding-left: 5%;
+  perspective: 900px;
+}
+
+.atom-3d-wrapper {
+  position: relative;
+  transform-style: preserve-3d;
+  transform: rotateX(22deg) rotateZ(18deg);
+  animation: precession-wobble-refined 10s ease-in-out infinite;
+}
+
+@keyframes precession-wobble-refined {
+  0%, 100% {
+    transform: rotateX(18deg) rotateZ(14deg);
+  }
+  25% {
+    transform: rotateX(26deg) rotateZ(18deg);
+  }
+  50% {
+    transform: rotateX(22deg) rotateZ(22deg);
+  }
+  75% {
+    transform: rotateX(18deg) rotateZ(18deg);
+  }
+}
+
+/* Cyan bloom behind atom */
+.atom-bloom {
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 280px;
+  height: 280px;
+  transform: translate(-50%, -50%);
+  background: radial-gradient(
+    ellipse at center,
+    rgba(35, 172, 213, 0.18) 0%,
+    rgba(35, 172, 213, 0.10) 35%,
+    rgba(35, 172, 213, 0.04) 65%,
+    transparent 100%
+  );
+  filter: blur(35px);
+  animation: bloom-pulse 4.5s ease-in-out infinite;
+  pointer-events: none;
+  z-index: -1;
+}
+
+@keyframes bloom-pulse {
+  0%, 100% {
+    opacity: 0.75;
+    transform: translate(-50%, -50%) scale(1);
+  }
+  50% {
+    opacity: 1;
+    transform: translate(-50%, -50%) scale(1.12);
+  }
+}
+
+/* Main SVG sizing */
+.atom-svg-refined {
+  display: block;
+  max-width: 380px;
+  width: 70%;
+  height: auto;
+  filter: drop-shadow(0 12px 35px rgba(35, 172, 213, 0.28));
+}
+
+/* Orbits container - rotates slowly (14-20s range) */
+.orbits-container-refined {
+  transform-origin: 170px 170px;
+  animation: rotate-orbits-refined 17s linear infinite;
+}
+
+@keyframes rotate-orbits-refined {
+  from {
+    transform: rotate(0deg);
+  }
+  to {
+    transform: rotate(360deg);
+  }
+}
+
+/* Orbit front segments - bright and glowing */
+.orbit-front {
+  animation: glow-pulse-refined 3.5s ease-in-out infinite;
+}
+
+@keyframes glow-pulse-refined {
+  0%, 100% {
+    opacity: 0.85;
+  }
+  50% {
+    opacity: 0.98;
+  }
+}
+
+/* Orbit back segments - faded and blurred */
+.orbit-back {
+  animation: fade-pulse-refined 4.5s ease-in-out infinite;
+}
+
+@keyframes fade-pulse-refined {
+  0%, 100% {
+    opacity: 0.28;
+  }
+  50% {
+    opacity: 0.20;
+  }
+}
+
+/* Electrons - path-locked, glow only */
+.electron-refined {
+  opacity: 1;
+}
+
+/* Nucleus animations */
+.nucleus-refined {
+  animation: pulse-nucleus-refined 3.2s ease-in-out infinite;
+}
+
+@keyframes pulse-nucleus-refined {
+  0%, 100% {
+    r: 15;
+    opacity: 1;
+  }
+  50% {
+    r: 16.5;
+    opacity: 0.96;
+  }
+}
+
+.nucleus-highlight-refined {
+  animation: shimmer-refined 2.8s ease-in-out infinite;
+}
+
+@keyframes shimmer-refined {
+  0%, 100% {
+    opacity: 0.55;
+  }
+  50% {
+    opacity: 0.8;
+  }
+}
+
+/* Responsive sizing */
+@media (max-width: 1280px) {
+  .atom-svg-refined {
+    max-width: 340px;
+    width: 65%;
+  }
+  
+  .atom-bloom {
+    width: 240px;
+    height: 240px;
+  }
+}
+
+@media (max-width: 1024px) {
+  .atom-container-refined {
+    justify-content: center;
+    padding-left: 0;
+  }
+  
+  .atom-svg-refined {
+    max-width: 300px;
+    width: 60%;
+  }
+  
+  .atom-bloom {
+    width: 220px;
+    height: 220px;
+  }
+  
+  .atom-3d-wrapper {
+    transform: rotateX(18deg) rotateZ(15deg);
+  }
+}
+
+@media (max-width: 640px) {
+  .atom-svg-refined {
+    max-width: 240px;
+    width: 55%;
+  }
+  
+  .atom-bloom {
+    width: 180px;
+    height: 180px;
+  }
+  
+  .atom-3d-wrapper {
+    transform: rotateX(15deg) rotateZ(12deg);
+  }
+}

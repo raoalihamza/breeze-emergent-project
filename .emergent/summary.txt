@@ -1,0 +1,196 @@
+<analysis>**original_problem_statement:**
+1.  **Phone Number Field:** Add a field for an agent's phone number in their profile, and ensure it's visible in their client's portal.
+2.  **Email Client Portal Invites:** Instead of copying a link, create a feature to send client portal invites directly via email using Resend.
+3.  **Client Portal Branding:** Brand the client portal experience with the Breeze Financial Group logo.
+4.  **Recruiting Page UI:** Reformat the recruiting section to be mobile-friendly, ensuring all buttons and text are clearly visible.
+5.  **Client Info Persistence:** Fix a bug on the Book of Business page where a client's email and phone number disappear when editing their information.
+6.  **Simplified Client Workflow:** On the Book of Business page, add a quick action button next to a client's name to open a modal that requires a PDF policy upload and provides a button to Email Client Portal Link.
+7.  **My Team UI/UX (Mobile):** Fix the Tree view on the My Team page to allow horizontal scrolling on mobile devices to view full agent names.
+8.  **My Team UI/UX (Desktop):** In the Table view on the My Team page, add a search function for agent names and sort the user list alphabetically by first name.
+9.  **Activate Production Page:** The Production page exists but is hidden. Make it active and visible in the main navigation.
+10. **Dashboard Redesign:** Remove the Quick Actions, Personal Production, and Team Growth sections from the Dashboard. Replace them with a company-wide leaderboard displaying the top 10 agents by submitted AP, highlighting the top 3.
+11. **Icon Styling:** Make the icons in the left-side navigation menu more lively and 3D looking.
+12. **Admin Edit Agent:** Create the ability for an admin to edit an agent's name, email, and NPN.
+13. **Cancel Invite Visibility:** Ensure the feature to cancel recruiting invites is visible and accessible to all users, not just admins.
+14. **Atlas AI Bug:** Diagnose and fix an unexpected error in Atlas AI to restore full functionality.
+15. **CEO Report Bug:** Fix the CEO Report feature in the Resources section, which was not computing anything when Generate Report was clicked.
+
+**User's preferred language**: English
+
+**what currently exists?**
+The Atlas application has undergone significant feature development and bug fixing. Key accomplishments include:
+-   **Admin & Agent Management:** Admins can now edit agent details (name, email, NPN). The My Team page has been enhanced with a searchable, sortable table view and a mobile-friendly, scrollable tree view.
+-   **Client Management:** The Book of Business page now has a persistent edit form and a new quick-action workflow to upload a policy and email a client portal link. Agents can add their phone numbers to their profiles, which now appear in the client portal.
+-   **Recruiting & Invites:** The recruiting page UI is now mobile-responsive. The Cancel Invite feature is now a visible button for all users. Client portal invites can be sent directly via email.
+-   **Bug Fixes & Activations:** Critical bugs in the Atlas AI and CEO Report features have been resolved. The previously hidden Production page is now active and accessible from the main navigation menu.
+-   **UI/UX Overhaul:** The main dashboard has been redesigned to feature a top-10 agent leaderboard. Sidebar navigation icons have been updated with a more modern, 3D style. The client portal is now branded with the Breeze Financial Group logo.
+
+**Last working item**:
+-   **Last item agent was working:** Updating the sidebar navigation icons to be more lively and 3D looking by applying gradients and hover effects.
+-   **Status:** USER VERIFICATION PENDING
+-   **Agent Testing Done:** Y
+-   **Which testing method agent to use?** screenshot tool
+-   **User Testing Done:** N
+
+**All Pending/In progress Issue list**:
+-   **Issue 1: Atlas AI Budget Exceeded (P1 - BLOCKED)**
+    -   **Description:** The Emergent LLM Key (Universal Key) budget is exhausted, preventing Atlas AI from processing complex, non-cached queries.
+    -   **Attempted fixes:** The agent diagnosed the issue and informed the user how to resolve it by adding funds or enabling auto top-up.
+    -   **Next debug checklist:** The user must add funds to their Universal Key via the Emergent dashboard. After funds are added, the agent should re-test a complex Atlas AI query to confirm full functionality is restored.
+    -   **Why fix this issue and what will be achieved with the fix?** This will restore the core functionality of the Atlas AI chatbot.
+    -   **Status:** BLOCKED
+    -   **Is recurring issue?** N
+    -   **Should Test frontend/backend/both after fix?** backend
+    -   **Blocked on other issue:** User action (adding funds).
+
+-   **Issue 2: Production Deployment Discrepancy (P2 - CRITICAL BLOCKER)**
+    -   **Description:** The production environment is running an older version of the code and does not reflect any of the recent features or fixes.
+    -   **Attempted fixes:** The agent previously fixed a deployment error ( endpoint) and has repeatedly informed the user that a manual deployment is necessary.
+    -   **Next debug checklist:** The agent must remind the user that they need to **manually trigger a new deployment** from their Emergent dashboard to push all recent changes to production.
+    -   **Why fix this issue and what will be achieved with the fix?** This is the most critical issue. Fixing it will make all newly developed features and bug fixes available in the live environment.
+    -   **Status:** BLOCKED
+    -   **Is recurring issue?** Y
+    -   **Should Test frontend/backend/both after fix?** Both (on production).
+    -   **Blocked on other issue:** User action (re-deployment).
+
+**In progress Task List**:
+-   None. All tasks from this session are complete, pending user verification.
+
+**Upcoming and Future Tasks**
+-   **Upcoming Tasks:**
+    -   **P0: Backend Refactor:** Decompose the monolithic  file into a modular structure (e.g., , , ). This is a critical technical debt item to improve maintainability.
+    -   **P1: Implement Tickets Backend Logic:** The API endpoints are routed, but the core logic for creating, updating status, and applying changes needs to be fully implemented in .
+    -   **P2: Zinnia Webhook Endpoint:** Build a Zapier webhook receiver at  to import production data.
+-   **Future Tasks:**
+    -   **P1: Quiz Analytics:** Implement tracking to identify which quiz questions agents struggle with most.
+    -   **P2: Enhanced Dashboards:** Create new dashboard components to visualize data from the Zinnia integration.
+
+**Completed work in this session**
+-   **Dashboard Redesign:** Replaced old dashboard components with a new company-wide Top 10 Agent Leaderboard.
+-   **Agent & Client Management Features:**
+    -   Implemented admin ability to edit agent name, email, and NPN.
+    -   Added a phone number field to agent profiles and made it visible in the client portal.
+    -   Fixed a bug where client email/phone disappeared on the Book of Business edit form.
+    -   Created a new workflow on Book of Business to attach a policy PDF and email a portal link.
+-   **UI/UX Improvements:**
+    -   Made the Recruiting page mobile-responsive.
+    -   Added horizontal scrolling to the My Team tree view for mobile.
+    -   Added search and alphabetical sorting to the My Team table view.
+    -   Updated sidebar navigation icons with a new 3D/gradient style.
+    -   Branded the client portal login and layout with the company logo.
+-   **Feature Activation & Bug Fixes:**
+    -   **Atlas AI:** Fixed a critical bug caused by an invalid model name and incorrect database connection checks.
+    -   **CEO Report:** Fixed a bug caused by an invalid model name and a frontend data parsing error.
+    -   **Production Page:** Activated the Production page, making it accessible in the navigation.
+    -   **Recruiting:** Made the Cancel Invite button visible for all users on the UI.
+-   **Email Integration:** Implemented a feature to send client portal invites directly via email using Resend.
+-   **Invite System Verification:** Confirmed that admins can bypass duplicate invite restrictions.
+
+**Earlier issues found/mentioned but not fixed**
+-   None.
+
+**Known issue recurrence from previous fork**
+-   **Issue recurrence in previous fork:** Production Deployment Discrepancy.
+-   **Recurrence count:** 5+
+-   **Status:** BLOCKED
+-   **Note:** This remains the most critical blocker preventing the user from seeing any of the implemented features in their live environment. User action is required.
+
+**Code Architecture**
+
+
+**Key Technical Concepts**
+-   **Backend:** FastAPI, Pydantic, JWT, Motor (async MongoDB), , Resend.
+-   **Frontend:** React, React Router, TailwindCSS, Axios, Shadcn UI, .
+-   **Database:** MongoDB.
+-   **Deployment:** The agent works in a preview environment; the user must manually deploy changes to production.
+
+**key DB schema**
+-   **users:**  (phone field now utilized)
+-   **clients:**  (policies can now be attached)
+-   **knowledge_base_documents:** 
+-   **quiz_questions:** 
+-   **atlas_ai_question_logs:** 
+
+**changes in tech stack**
+-   No new packages were installed. Existing integrations like Resend were utilized more deeply.
+
+**All files of reference**
+-   **/app/backend/server.py**: Main API file. Heavily modified with new endpoints for editing users, updating client info, uploading documents, and fetching leaderboard data.
+-   **/app/backend/atlas_ai_service.py**: Fixed incorrect model names and database connection logic.
+-   **/app/backend/email_service.py**: Added a new function to send client portal invites.
+-   **/app/frontend/src/pages/Dashboard.js**: Completely overhauled to display the new agent leaderboard.
+-   **/app/frontend/src/pages/MyTeam.js**: Major UI/UX updates including search, sorting, and mobile scrolling.
+-   **/app/frontend/src/pages/BookOfBusiness.js**: Fixed a state persistence bug in the edit client modal.
+-   **/app/frontend/src/pages/MyClients.js**: Implemented a new client workflow for PDF uploads and email invites.
+-   **/app/frontend/src/pages/Recruiting.js**: UI updated to be mobile-friendly and to always show the Cancel Invite button.
+-   **/app/frontend/src/components/Layout.js**: Enabled the Production page link and updated all navigation icons.
+-   **/app/frontend/src/pages/CEOReport.jsx**: Fixed a frontend rendering issue.
+-   **/app/components/AdminControlModals.js**: Added a new modal for editing agent details.
+-   **/app/pages/Profile.js**: Added UI for agents to update their phone number.
+
+**Areas that need refactoring**:
+-   **CRITICAL:** The  monolith must be broken down into a modular structure (e.g., , , ).
+-   ** and ** have grown significantly in complexity and state management. They should be broken down into smaller, more manageable components.
+
+**key api endpoints**
+-   : (NEW) Updates an agent's name, email, and NPN.
+-   : (NEW) Updates the current user's phone number.
+-   : (NEW) Sends a client portal invite email.
+-   : (NEW) Updates a client's information.
+-   : (NEW) Uploads a policy PDF for a client.
+-   : (NEW) Fetches data for the dashboard leaderboard.
+-   : (UI Added) The UI now uses this existing endpoint.
+-   : (FIXED) Restored functionality.
+-   : (FIXED) Restored functionality.
+
+**Critical Info for New Agent**
+-   **Top 2 Blockers:**
+    1.  **Production Deployment:** The user MUST redeploy the app from the Emergent dashboard to see any of the extensive new changes live. This is a recurring issue and the most critical action item for the user.
+    2.  **AI Budget:** The Atlas AI feature is partially non-functional due to an exceeded Universal Key budget. The user MUST add funds for full functionality to be restored.
+-   **Next Major Task:** The highest priority technical task is to plan and begin the refactor of . Confirm with the user before starting this large task.
+
+**documents and test reports created in this job**
+-    (Used by testing agent, but not a persistent report)
+
+**Last 10 User Messages and any pending HUMAN messages**
+1.  **Request:** Make sidebar icons more lively and 3D. (COMPLETED)
+2.  **Request:** Redesign the Dashboard page to be a top 10 agent leaderboard. (COMPLETED)
+3.  **Request:** Bring back/activate the Production page. (COMPLETED)
+4.  **Request:** Add mobile scroll to My Team Tree view and search/sort to Table view. (COMPLETED)
+5.  **Clarification:** The client info bug (disappearing email/phone) is on the Book of Business page. (COMPLETED)
+6.  **Request:** Fix client info persistence bug and add a new workflow to attach a policy PDF and email the client portal link. (COMPLETED)
+7.  **Request:** Make the Recruiting page mobile-friendly. (COMPLETED)
+8.  **Request:** Add agent phone number field and implement email-based client portal invites with branding. (COMPLETED)
+9.  **Bug Report:** The CEO Report is not functional. (COMPLETED)
+10. **Bug Report:** Atlas AI is giving an unexpected error. (COMPLETED)
+
+**Project Health Check:**
+-   **Broken:**
+    -   The production environment is severely out-of-date and not reflecting any recent work.
+    -   The Atlas AI feature is partially non-functional due to the exhausted LLM budget.
+-   **Mocked:**
+    -   The Tickets system backend logic is not implemented.
+    -   The Zinnia webhook integration is not built.
+
+**3rd Party Integrations**
+-   **Claude Sonnet 4 & Haiku:** (via ) Used for Atlas AI & CEO Report. Uses Emergent LLM Key.
+-   **Resend:** Used for transactional emails (recruiting and client portal invites).
+-   **Recharts:** Used for charts on the Production page.
+-   **React Flow:** Used for the visual organization chart in My Team.
+
+**Testing status**
+-   **Testing agent used after significant changes:** YES (for client management and edit agent features)
+-   **Troubleshoot agent used after agent stuck in loop:** YES (for diagnosing the Atlas AI issue)
+-   **Test files created:** None.
+-   **Known regressions:** None in the preview environment. The production environment is the main point of failure due to not being updated.
+
+**Credentials to test flow:**
+-   **Admin:**
+    -   Email: 
+    -   Password: 
+-   **Test Agent (Katie Cheek):**
+    -   Email: 
+    -   Password: 
+
+**What agent forgot to execute**
+-   All user requests from this session were addressed and implemented.</analysis>
