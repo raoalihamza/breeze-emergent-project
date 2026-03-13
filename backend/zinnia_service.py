@@ -1,0 +1,606 @@
+"""
+Zinnia SmartOffice Integration Service
+- Connects to SmartOffice API (XML-based REST)
+- Pulls contacts, production/policy data, activity data
+- Saves to MongoDB Atlas with bulk upserts
+- Background sync for large datasets (260K+ contacts)
+- Incremental sync after initial load
+- Scheduled automatic sync every 3 hours
+"""
+
+import os
+import httpx
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Optional
+from dotenv import load_dotenv
+import uuid
+import xml.etree.ElementTree as ET
+from pymongo import UpdateOne
+
+load_dotenv()
+
+logger = logging.getLogger(__name__)
+
+# ─── Zinnia API Config ────────────────────────────────────────────────────────
+ZINNIA_API_URL = "https://api.sandbox.smartofficecrm.com/bwm/v1/send"
+ZINNIA_SITE_NAME = os.environ.get("ZINNIA_SITE_NAME", "PREPRODNEW")
+ZINNIA_USERNAME = os.environ.get("ZINNIA_USERNAME", "PREPRODNEW_SDC_UAT_bbrandon")
+ZINNIA_API_KEY = os.environ.get("ZINNIA_API_KEY", "")
+ZINNIA_API_SECRET = os.environ.get("ZINNIA_API_SECRET", "")
+
+# MongoDB
+MONGO_URL = os.environ.get("MONGO_URL", "mongodb://localhost:27017")
+DB_NAME = os.environ.get("DB_NAME", "breeze_atlas")
+
+# DB instance (will be set from server.py)
+db = None
+
+# Sync locks to prevent concurrent syncs of same type
+_sync_locks = {
+    "agents": asyncio.Lock(),
+    "production": asyncio.Lock(),
+    "cases": asyncio.Lock(),
+}
+
+# Track running background tasks
+_background_tasks = {}
+
+MAX_RETRIES = 3
+PAGE_SIZE = 100
+PAGE_DELAY = 0.3  # seconds between API pages
+
+
+def set_db(database):
+    """Set MongoDB database instance from server.py"""
+    global db
+    db = database
+
+
+# ─── XML Request Builder ─────────────────────────────────────────────────────
+
+def build_headers():
+    """Build SmartOffice API headers"""
+    api_key = os.environ.get("ZINNIA_API_KEY") or "328ab6e47a8044e38153c0b808a552db"
+    api_secret = os.environ.get("ZINNIA_API_SECRET") or "ioOOq96XPkRkV1JejgWOkPAt54cg9ZRm"
+    site_name = os.environ.get("ZINNIA_SITE_NAME") or "PREPRODNEW"
+    username = os.environ.get("ZINNIA_USERNAME") or "PREPRODNEW_SDC_UAT_bbrandon"
+
+    return {
+        "sitename": site_name,
+        "username": username,
+        "api-key": api_key,
+        "api-secret": api_secret,
+        "Content-Type": "application/xml"
+    }
+
+
+def build_agent_search_xml(page: int = 0, pagesize: int = 100, searchid: str = "") -> str:
+    return f"""<?xml version="1.0"?>
+<request version="1.0">
+    <header>
+        <office></office>
+        <user></user>
+        <password></password>
+        <keepsession>true</keepsession>
+    </header>
+    <search searchid="{searchid}" total="true" pagesize="{pagesize}" page="{page}">
+        <object>
+            <Contact>
+                <LastName/>
+                <FirstName/>
+                <NPN/>
+                <ContactType/>
+            </Contact>
+        </object>
+    </search>
+</request>"""
+
+
+def build_production_search_xml(page: int = 0, pagesize: int = 100, searchid: str = "") -> str:
+    """Build XML request to fetch production/policy data"""
+    return f"""<?xml version="1.0"?>
+<request version="1.0">
+    <header>
+        <office></office>
+        <user></user>
+        <password></password>
+        <keepsession>true</keepsession>
+    </header>
+    <search searchid="{searchid}" total="true" pagesize="{pagesize}" page="{page}">
+        <object>
+            <Policy>
+                <PolicyNumber/>
+                <CarrierName/>
+                <AnnualPremium/>
+                <InsuredName/>
+            </Policy>
+        </object>
+    </search>
+</request>"""
+
+
+def build_case_status_xml(page: int = 0, pagesize: int = 100, searchid: str = "") -> str:
+    """Build XML request to fetch activity/case status data"""
+    return f"""<?xml version="1.0"?>
+<request version="1.0">
+    <header>
+        <office></office>
+        <user></user>
+        <password></password>
+        <keepsession>true</keepsession>
+    </header>
+    <search searchid="{searchid}" total="true" pagesize="{pagesize}" page="{page}">
+        <object>
+            <Activity>
+                <Subject/>
+                <ActivityType/>
+            </Activity>
+        </object>
+    </search>
+</request>"""
+
+
+# ─── API Call ────────────────────────────────────────────────────────────────
+
+async def call_smartoffice_api(xml_body: str) -> Optional[ET.Element]:
+    """Make a POST request to SmartOffice API and return parsed XML.
+    Returns (root_element, is_network_error) — caller uses is_network_error
+    to decide whether to use long or short retry delays.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                ZINNIA_API_URL,
+                headers=build_headers(),
+                content=xml_body.encode("utf-8")
+            )
+            response.raise_for_status()
+            raw = response.content
+            # Strip UTF-8 BOM if present
+            if raw.startswith(b'\xef\xbb\xbf'):
+                raw = raw[3:]
+            root = ET.fromstring(raw)
+            return root, False
+
+    except httpx.HTTPStatusError as e:
+        logger.error(f"SmartOffice API HTTP error: {e.response.status_code} - {e.response.text[:200]}")
+        return None, False
+    except httpx.RequestError as e:
+        # Network errors (DNS failure, connection reset) — need longer wait to recover
+        logger.error(f"SmartOffice API network error: {str(e)}")
+        return None, True
+    except ET.ParseError as e:
+        logger.error(f"SmartOffice XML parse error: {str(e)}")
+        return None, False
+
+
+async def call_smartoffice_api_with_retry(xml_body: str) -> Optional[ET.Element]:
+    """Call SmartOffice API with smart retry logic.
+    - Network errors (DNS/connection): up to 8 retries, 30s-120s backoff
+    - API/parse errors: up to 3 retries, 2s-6s backoff
+    """
+    network_retries = 0
+    api_retries = 0
+    max_network_retries = 8
+    max_api_retries = 3
+
+    while True:
+        result, is_network_error = await call_smartoffice_api(xml_body)
+        if result is not None:
+            return result
+
+        if is_network_error:
+            network_retries += 1
+            if network_retries > max_network_retries:
+                logger.error(f"Network error: gave up after {max_network_retries} retries")
+                return None
+            # Wait 30s, 60s, 60s, 60s... for DNS/connection recovery
+            wait = 30 if network_retries == 1 else 60
+            logger.warning(f"Network error, retrying in {wait}s (network attempt {network_retries}/{max_network_retries})")
+            await asyncio.sleep(wait)
+        else:
+            api_retries += 1
+            if api_retries > max_api_retries:
+                logger.error(f"API error: gave up after {max_api_retries} retries")
+                return None
+            wait = api_retries * 2  # 2s, 4s, 6s
+            logger.warning(f"API error, retrying in {wait}s (api attempt {api_retries}/{max_api_retries})")
+            await asyncio.sleep(wait)
+
+
+# ─── Data Parsers ─────────────────────────────────────────────────────────────
+
+def _find_search_element(xml_root: ET.Element) -> Optional[ET.Element]:
+    """Find the <search> element in the response, handling edge cases."""
+    search_elem = xml_root.find("search")
+    if search_elem is not None:
+        return search_elem
+    search_elem = xml_root.find(".//search")
+    if search_elem is not None:
+        return search_elem
+    children = [child.tag for child in xml_root]
+    logger.warning(f"Could not find <search> element. Root tag: {xml_root.tag}, children: {children}")
+    return None
+
+
+def parse_agents(xml_root: ET.Element) -> list:
+    """Parse agent XML response into list of dicts"""
+    agents = []
+    try:
+        search_elem = _find_search_element(xml_root)
+        if search_elem is None:
+            return agents
+
+        for contact in search_elem.findall("Contact"):
+            raw_id = contact.get("id", "")
+            smartoffice_id = raw_id.split(".")[-1] if raw_id else ""
+            if not smartoffice_id:
+                continue
+
+            agents.append({
+                "smartoffice_id": smartoffice_id,
+                "smartoffice_raw_id": raw_id,
+                "last_name": contact.findtext("LastName", "").strip(),
+                "first_name": contact.findtext("FirstName", "").strip(),
+                "npn": contact.findtext("NPN", "").strip(),
+                "contact_type": contact.findtext("ContactType", ""),
+                "synced_at": datetime.now(timezone.utc).isoformat(),
+                "source": "smartoffice"
+            })
+
+    except Exception as e:
+        logger.error(f"Error parsing agents: {str(e)}")
+
+    return agents
+
+
+def parse_production(xml_root: ET.Element) -> list:
+    """Parse production/policy XML response into list of dicts"""
+    policies = []
+    try:
+        search_elem = _find_search_element(xml_root)
+        if search_elem is None:
+            return policies
+
+        for policy in search_elem.findall("Policy"):
+            raw_id = policy.get("id", "")
+            smartoffice_id = raw_id.split(".")[-1] if raw_id else ""
+            if not smartoffice_id:
+                continue
+
+            policies.append({
+                "smartoffice_id": smartoffice_id,
+                "smartoffice_raw_id": raw_id,
+                "policy_number": policy.findtext("PolicyNumber", "").strip(),
+                "carrier_name": policy.findtext("CarrierName", "").strip(),
+                "annual_premium": policy.findtext("AnnualPremium", "0").strip(),
+                "insured_name": policy.findtext("InsuredName", "").strip(),
+                "synced_at": datetime.now(timezone.utc).isoformat(),
+                "source": "smartoffice"
+            })
+
+    except Exception as e:
+        logger.error(f"Error parsing production data: {str(e)}")
+
+    return policies
+
+
+def parse_case_status(xml_root: ET.Element) -> list:
+    """Parse activity/case status XML response into list of dicts"""
+    cases = []
+    try:
+        search_elem = _find_search_element(xml_root)
+        if search_elem is None:
+            return cases
+
+        for activity in search_elem.findall("Activity"):
+            raw_id = activity.get("id", "")
+            smartoffice_id = raw_id.split(".")[-1] if raw_id else ""
+            if not smartoffice_id:
+                continue
+
+            cases.append({
+                "smartoffice_id": smartoffice_id,
+                "smartoffice_raw_id": raw_id,
+                "subject": activity.findtext("Subject", "").strip(),
+                "activity_type": activity.findtext("ActivityType", ""),
+                "synced_at": datetime.now(timezone.utc).isoformat(),
+                "source": "smartoffice"
+            })
+
+    except Exception as e:
+        logger.error(f"Error parsing case status: {str(e)}")
+
+    return cases
+
+
+# ─── Database Save (Bulk Upsert) ─────────────────────────────────────────────
+
+async def bulk_upsert(collection_name: str, records: list, match_field: str = "smartoffice_id") -> dict:
+    """Bulk upsert records into MongoDB using bulk_write for performance.
+    Each record is matched by match_field and upserted (insert if new, update if exists).
+    """
+    if not records or db is None:
+        return {"upserted": 0, "modified": 0}
+
+    collection = db[collection_name]
+    operations = []
+
+    for record in records:
+        if not record.get(match_field):
+            continue
+        # Ensure each record has a UUID id for new inserts
+        operations.append(
+            UpdateOne(
+                {match_field: record[match_field]},
+                {"$set": record, "$setOnInsert": {"id": str(uuid.uuid4())}},
+                upsert=True
+            )
+        )
+
+    if not operations:
+        return {"upserted": 0, "modified": 0}
+
+    try:
+        result = await collection.bulk_write(operations, ordered=False)
+        return {
+            "upserted": result.upserted_count,
+            "modified": result.modified_count
+        }
+    except Exception as e:
+        logger.error(f"Bulk upsert error on {collection_name}: {str(e)}")
+        return {"upserted": 0, "modified": 0, "error": str(e)}
+
+
+async def log_sync(sync_type: str, status: str, details: dict):
+    """Log sync activity to MongoDB"""
+    if db is None:
+        return
+
+    log_entry = {
+        "id": str(uuid.uuid4()),
+        "sync_type": sync_type,
+        "status": status,
+        "details": details,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+    try:
+        await db.zinnia_sync_logs.insert_one(log_entry)
+    except Exception as e:
+        logger.error(f"Error logging sync: {str(e)}")
+
+
+async def get_sync_state(sync_type: str) -> Optional[dict]:
+    """Get the sync state for a given type from MongoDB"""
+    if db is None:
+        return None
+    return await db.zinnia_sync_state.find_one({"sync_type": sync_type}, {"_id": 0})
+
+
+async def update_sync_state(sync_type: str, state: dict):
+    """Update sync state in MongoDB"""
+    if db is None:
+        return
+    await db.zinnia_sync_state.update_one(
+        {"sync_type": sync_type},
+        {"$set": {**state, "sync_type": sync_type}},
+        upsert=True
+    )
+
+
+# ─── Main Sync Functions ──────────────────────────────────────────────────────
+
+async def _paginated_sync(
+    sync_type: str,
+    build_xml_fn,
+    parse_fn,
+    collection_name: str,
+) -> dict:
+    """Generic paginated sync: fetches all pages from SmartOffice API,
+    saves each page to MongoDB immediately via bulk upsert.
+    Memory-efficient — never holds more than 1 page (100 records) in memory.
+    """
+    logger.info(f"Starting {sync_type} sync from SmartOffice...")
+
+    total_fetched = 0
+    total_upserted = 0
+    total_modified = 0
+    page = 0
+    searchid = ""
+
+    while True:
+        xml_body = build_xml_fn(page=page, pagesize=PAGE_SIZE, searchid=searchid)
+        xml_root = await call_smartoffice_api_with_retry(xml_body)
+
+        if xml_root is None:
+            error_msg = f"API call failed on page {page} after {MAX_RETRIES} retries"
+            logger.error(f"{sync_type}: {error_msg}")
+            await log_sync(sync_type, "failed", {
+                "error": error_msg,
+                "pages_completed": page,
+                "total_fetched": total_fetched,
+            })
+            return {
+                "status": "failed",
+                "error": error_msg,
+                "pages_completed": page,
+                "total_fetched": total_fetched,
+                "upserted": total_upserted,
+                "modified": total_modified,
+            }
+
+        search_elem = _find_search_element(xml_root)
+        if search_elem is None:
+            break
+
+        if page == 0:
+            searchid = search_elem.get("searchid", "")
+
+        # Parse this page's records
+        records = parse_fn(xml_root)
+        page_count = len(records)
+        total_fetched += page_count
+
+        # Save immediately — don't accumulate in memory
+        if records:
+            result = await bulk_upsert(collection_name, records)
+            total_upserted += result.get("upserted", 0)
+            total_modified += result.get("modified", 0)
+
+        more = search_elem.get("more", "false")
+        api_total = search_elem.get("total", "?")
+
+        if page % 50 == 0 or more != "true":
+            logger.info(
+                f"{sync_type} page {page}: +{page_count} records, "
+                f"total fetched: {total_fetched}/{api_total}, more: {more}"
+            )
+
+        if more != "true" or page_count == 0:
+            break
+
+        page += 1
+        await asyncio.sleep(PAGE_DELAY)
+
+    # Update sync state
+    await update_sync_state(sync_type, {
+        "initial_sync_done": True,
+        "last_sync_time": datetime.now(timezone.utc).isoformat(),
+        "total_records": total_fetched,
+        "pages": page + 1,
+    })
+
+    await log_sync(sync_type, "success", {
+        "total_fetched": total_fetched,
+        "upserted": total_upserted,
+        "modified": total_modified,
+        "pages": page + 1,
+    })
+
+    logger.info(
+        f"{sync_type} sync complete: {total_fetched} records across {page + 1} pages "
+        f"(upserted: {total_upserted}, modified: {total_modified})"
+    )
+
+    return {
+        "status": "success",
+        "total_fetched": total_fetched,
+        "upserted": total_upserted,
+        "modified": total_modified,
+        "pages": page + 1,
+    }
+
+
+async def sync_agents() -> dict:
+    """Pull ALL agents from SmartOffice with pagination and save to MongoDB.
+    Uses lock to prevent concurrent agent syncs.
+    """
+    if _sync_locks["agents"].locked():
+        return {"status": "already_running", "message": "Agent sync is already in progress"}
+
+    async with _sync_locks["agents"]:
+        return await _paginated_sync(
+            sync_type="agents",
+            build_xml_fn=build_agent_search_xml,
+            parse_fn=parse_agents,
+            collection_name="zinnia_agents",
+        )
+
+
+async def sync_production() -> dict:
+    """Pull ALL production data from SmartOffice with pagination and save to MongoDB"""
+    if _sync_locks["production"].locked():
+        return {"status": "already_running", "message": "Production sync is already in progress"}
+
+    async with _sync_locks["production"]:
+        return await _paginated_sync(
+            sync_type="production",
+            build_xml_fn=build_production_search_xml,
+            parse_fn=parse_production,
+            collection_name="zinnia_production",
+        )
+
+
+async def sync_case_status() -> dict:
+    """Pull ALL case/activity status from SmartOffice with pagination and save to MongoDB"""
+    if _sync_locks["cases"].locked():
+        return {"status": "already_running", "message": "Case sync is already in progress"}
+
+    async with _sync_locks["cases"]:
+        return await _paginated_sync(
+            sync_type="cases",
+            build_xml_fn=build_case_status_xml,
+            parse_fn=parse_case_status,
+            collection_name="zinnia_cases",
+        )
+
+
+async def sync_agents_background() -> dict:
+    """Fire-and-forget agent sync — returns immediately, runs in background"""
+    if _sync_locks["agents"].locked():
+        return {"status": "already_running", "message": "Agent sync is already in progress"}
+
+    task = asyncio.create_task(sync_agents())
+    _background_tasks["agents"] = task
+    return {"status": "started", "message": "Agent sync started in background"}
+
+
+async def sync_all() -> dict:
+    """Run all syncs.
+    Production & cases run first (fast, sequential to avoid SmartOffice session conflicts).
+    Agents start in background only after production & cases are complete.
+    """
+    logger.info("=== Starting Full Zinnia Sync ===")
+
+    # Production & cases first — sequential, fast (~15 seconds total)
+    production_result = await sync_production()
+    cases_result = await sync_case_status()
+
+    # Agents last — fire in background after others finish (no concurrent API calls)
+    agents_result = await sync_agents_background()
+
+    results = {
+        "agents": agents_result,
+        "production": production_result,
+        "cases": cases_result,
+        "sync_time": datetime.now(timezone.utc).isoformat()
+    }
+
+    logger.info("=== Sync triggered: production & cases done, agents running in background ===")
+    return results
+
+
+async def get_sync_status() -> dict:
+    """Get current sync status for all types"""
+    status = {}
+    for sync_type in ["agents", "production", "cases"]:
+        state = await get_sync_state(sync_type)
+        is_running = _sync_locks[sync_type].locked()
+        status[sync_type] = {
+            "is_running": is_running,
+            "initial_sync_done": state.get("initial_sync_done", False) if state else False,
+            "last_sync_time": state.get("last_sync_time") if state else None,
+            "total_records": state.get("total_records", 0) if state else 0,
+        }
+    return status
+
+
+# ─── Scheduler ───────────────────────────────────────────────────────────────
+
+async def start_scheduler(interval_minutes: int = 180):
+    """Run sync every 3 hours automatically.
+    First run triggers immediately on startup.
+    """
+    logger.info(f"Zinnia sync scheduler started — runs every {interval_minutes} minutes")
+
+    while True:
+        try:
+            await sync_all()
+        except Exception as e:
+            logger.error(f"Scheduler sync error: {str(e)}")
+            await log_sync("scheduler", "failed", {"error": str(e)})
+
+        await asyncio.sleep(interval_minutes * 60)

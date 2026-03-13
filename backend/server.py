@@ -19,6 +19,7 @@ from collections import defaultdict
 import time
 import aiofiles
 import shutil
+import asyncio
 
 ROOT_DIR = Path(__file__).parent
 KNOWLEDGE_FILES_DIR = ROOT_DIR / 'knowledge_files'
@@ -42,6 +43,12 @@ from email_service import (
 
 # Import Atlas AI service
 from atlas_ai_service import get_atlas_ai_response, process_uploaded_document, set_db as set_atlas_db
+from zinnia_service import (
+    sync_all, sync_agents, sync_production,
+    sync_case_status, start_scheduler,
+    get_sync_status,
+    set_db as set_zinnia_db
+)
 
 mongo_url = os.environ['MONGO_URL']
 client = AsyncIOMotorClient(mongo_url)
@@ -5612,6 +5619,9 @@ async def startup_db():
     # Set the database instance for atlas_ai_service
     set_atlas_db(db)
     
+    set_zinnia_db(db)
+    asyncio.create_task(start_scheduler(interval_minutes=180))
+    
     admin_exists = await db.users.find_one({'email': 'kyle@breezewealthmanagement.com'})
     if not admin_exists:
         admin_id = str(uuid.uuid4())
@@ -6292,6 +6302,56 @@ async def get_question_analytics(current_user: dict = Depends(get_current_user))
     except Exception as e:
         logger.error(f"Failed to get question analytics: {e}")
         raise HTTPException(status_code=500, detail="Failed to retrieve analytics")
+
+@api_router.post("/zinnia/sync")
+async def trigger_zinnia_sync(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    result = await sync_all()
+    return result
+
+@api_router.get("/zinnia/sync/agents")
+async def sync_zinnia_agents(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    return await sync_agents()
+
+@api_router.get("/zinnia/sync/production")
+async def sync_zinnia_production(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    return await sync_production()
+
+@api_router.get("/zinnia/sync/cases")
+async def sync_zinnia_cases(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    return await sync_case_status()
+
+@api_router.get("/zinnia/sync/status")
+async def zinnia_sync_status(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    return await get_sync_status()
+
+@api_router.get("/zinnia/logs")
+async def get_zinnia_logs(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    logs = await db.zinnia_sync_logs.find(
+        {}, {'_id': 0}
+    ).sort("timestamp", -1).limit(50).to_list(50)
+    return logs
+
+@api_router.get("/zinnia/agents")
+async def get_zinnia_agents(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    agents = await db.zinnia_agents.find(
+        {}, {'_id': 0}
+    ).to_list(1000)
+    return agents
+
+@api_router.get("/zinnia/production")
+async def get_zinnia_production(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    data = await db.zinnia_production.find(
+        {}, {'_id': 0}
+    ).to_list(1000)
+    return data
 
 # Include router and middleware AFTER all routes are defined
 app.include_router(api_router)
