@@ -9,11 +9,13 @@ Zinnia SmartOffice Integration Service
 """
 
 import os
+import re
 import httpx
 import asyncio
 import logging
 from datetime import datetime, timezone
 from typing import Optional
+from difflib import SequenceMatcher
 from dotenv import load_dotenv
 import uuid
 import xml.etree.ElementTree as ET
@@ -47,6 +49,18 @@ _sync_locks = {
 # Track running background tasks
 _background_tasks = {}
 
+# Matching progress state
+_matching_progress = {
+    "status": "idle",          # idle | running | complete | failed
+    "total_processed": 0,
+    "matched_by_npn": 0,
+    "matched_by_name": 0,
+    "unmatched": 0,
+    "started_at": None,
+    "completed_at": None,
+    "error": None,
+}
+
 MAX_RETRIES = 3
 PAGE_SIZE = 100
 PAGE_DELAY = 0.3  # seconds between API pages
@@ -56,6 +70,257 @@ def set_db(database):
     """Set MongoDB database instance from server.py"""
     global db
     db = database
+
+
+# ─── Data Normalization Utilities ─────────────────────────────────────────────
+
+def normalize_name(name: str) -> str:
+    """Capitalize name properly: 'john doe' -> 'John Doe'"""
+    if not name or not name.strip():
+        return ""
+    return name.strip().title()
+
+
+def normalize_phone(phone: str) -> str:
+    """Standardize phone to E.164-ish format: (555) 123-4567 -> +15551234567"""
+    if not phone or not phone.strip():
+        return ""
+    digits = re.sub(r"\D", "", phone.strip())
+    if not digits:
+        return ""
+    if len(digits) == 10:
+        digits = "1" + digits
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return f"+{digits}"
+
+
+def normalize_date(date_str: str) -> str:
+    """Convert common date formats to ISO 8601. Returns original if unparseable."""
+    if not date_str or not date_str.strip():
+        return ""
+    date_str = date_str.strip()
+
+    formats = [
+        "%m/%d/%Y",          # 01/15/2024
+        "%m-%d-%Y",          # 01-15-2024
+        "%Y-%m-%d",          # 2024-01-15
+        "%m/%d/%Y %H:%M:%S", # 01/15/2024 14:30:00
+        "%Y-%m-%dT%H:%M:%S", # 2024-01-15T14:30:00
+        "%m/%d/%y",          # 01/15/24
+        "%B %d, %Y",        # January 15, 2024
+        "%b %d, %Y",        # Jan 15, 2024
+    ]
+    for fmt in formats:
+        try:
+            dt = datetime.strptime(date_str, fmt)
+            return dt.strftime("%Y-%m-%dT%H:%M:%S") + "Z"
+        except ValueError:
+            continue
+
+    # Already ISO 8601
+    if re.match(r"\d{4}-\d{2}-\d{2}T", date_str):
+        return date_str
+
+    return date_str
+
+
+# ─── Agent Matching ──────────────────────────────────────────────────────────
+
+FUZZY_MATCH_THRESHOLD = 0.85
+
+
+async def run_agent_matching(limit: int = 0) -> dict:
+    """Bulk matching orchestrator — scales to any number of agents.
+    Strategy:
+    1. Load ALL Atlas users into memory once (small set, never millions)
+    2. Build O(1) NPN and exact-name lookup dicts in Python
+    3. Use a server-side MongoDB cursor to stream zinnia_agents without skip()
+    4. Accumulate batches of 1000, bulk write per batch — no per-document queries
+    """
+    global _matching_progress
+
+    if db is None:
+        return {"error": "Database not initialized"}
+
+    _matching_progress.update({
+        "status": "running",
+        "total_processed": 0,
+        "matched_by_npn": 0,
+        "matched_by_name": 0,
+        "unmatched": 0,
+        "started_at": datetime.now(timezone.utc).isoformat(),
+        "completed_at": None,
+        "error": None,
+    })
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    # ── Load all Atlas users into memory once ────────────────────────────────
+    all_users = await db.users.find({}, {"_id": 0}).to_list(None)
+
+    npn_lookup: dict = {}
+    name_lookup: dict = {}
+    name_list: list = []  # [(normalized_full_name, user), ...] for fuzzy
+
+    for u in all_users:
+        npn = (u.get("npn") or "").strip()
+        if npn:
+            npn_lookup[npn] = u
+
+        raw = (u.get("name") or "").strip().lower()
+        parts = raw.split()
+        if len(parts) >= 2:
+            key = f"{parts[0]} {parts[-1]}"
+            name_lookup[key] = u
+            name_list.append((raw, u))
+
+    # ── Stream zinnia_agents via cursor, process in batches ──────────────────
+    matched_npn = 0
+    matched_name = 0
+    unmatched = 0
+    total_agents = 0
+    batch_num = 0
+
+    await db.zinnia_unmatched.delete_many({})
+
+    BATCH_SIZE = 1000
+    agent_updates: list = []
+    unmatched_inserts: list = []
+
+    query = db.zinnia_agents.find({}, {"_id": 0})
+    if limit > 0:
+        query = query.limit(limit)
+
+    async for agent in query:
+        so_id = agent.get("smartoffice_id", "")
+        npn = (agent.get("npn") or "").strip()
+        first = (agent.get("first_name") or "").strip().lower()
+        last = (agent.get("last_name") or "").strip().lower()
+        name_key = f"{first} {last}" if first and last else ""
+
+        matched = False
+
+        # NPN match
+        if npn and npn in npn_lookup:
+            user = npn_lookup[npn]
+            agent_updates.append(UpdateOne(
+                {"smartoffice_id": so_id},
+                {"$set": {"atlas_user_id": user.get("id"), "match_type": "npn", "matched_at": now_ts}}
+            ))
+            matched_npn += 1
+            matched = True
+
+        # Exact name match
+        elif name_key and name_key in name_lookup:
+            user = name_lookup[name_key]
+            agent_updates.append(UpdateOne(
+                {"smartoffice_id": so_id},
+                {"$set": {"atlas_user_id": user.get("id"), "match_type": "name_exact", "matched_at": now_ts}}
+            ))
+            matched_name += 1
+            matched = True
+
+        # Fuzzy name match
+        elif name_key and name_list:
+            best_ratio = 0.0
+            best_user = None
+            for candidate_name, candidate_user in name_list:
+                ratio = SequenceMatcher(None, name_key, candidate_name).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_user = candidate_user
+            if best_user and best_ratio >= FUZZY_MATCH_THRESHOLD:
+                agent_updates.append(UpdateOne(
+                    {"smartoffice_id": so_id},
+                    {"$set": {
+                        "atlas_user_id": best_user.get("id"),
+                        "match_type": f"name_fuzzy:{best_ratio:.2f}",
+                        "matched_at": now_ts,
+                    }}
+                ))
+                matched_name += 1
+                matched = True
+
+        if not matched:
+            reason_parts = ["no_npn" if not npn else "npn_not_found"]
+            reason_parts.append("name_not_matched" if name_key else "no_name")
+            unmatched_inserts.append({
+                "smartoffice_id": so_id,
+                "first_name": agent.get("first_name", ""),
+                "last_name": agent.get("last_name", ""),
+                "npn": npn,
+                "contact_type": agent.get("contact_type", ""),
+                "reason": ", ".join(reason_parts),
+                "reviewed": False,
+                "created_at": now_ts,
+            })
+            unmatched += 1
+
+        total_agents += 1
+
+        # Flush batch every BATCH_SIZE records
+        if total_agents % BATCH_SIZE == 0:
+            if agent_updates:
+                await db.zinnia_agents.bulk_write(agent_updates, ordered=False)
+                agent_updates = []
+            if unmatched_inserts:
+                await db.zinnia_unmatched.insert_many(unmatched_inserts, ordered=False)
+                unmatched_inserts = []
+            batch_num += 1
+            _matching_progress.update({
+                "total_processed": total_agents,
+                "matched_by_npn": matched_npn,
+                "matched_by_name": matched_name,
+                "unmatched": unmatched,
+            })
+            logger.info(
+                f"Matching batch {batch_num}: {total_agents} processed — "
+                f"npn:{matched_npn} name:{matched_name} unmatched:{unmatched}"
+            )
+
+    # Flush remaining records
+    if agent_updates:
+        await db.zinnia_agents.bulk_write(agent_updates, ordered=False)
+    if unmatched_inserts:
+        await db.zinnia_unmatched.insert_many(unmatched_inserts, ordered=False)
+
+    result = {
+        "status": "success",
+        "total_agents": total_agents,
+        "matched_by_npn": matched_npn,
+        "matched_by_name": matched_name,
+        "unmatched": unmatched,
+        "matched_at": now_ts,
+    }
+
+    _matching_progress.update({
+        "status": "complete",
+        "total_processed": total_agents,
+        "matched_by_npn": matched_npn,
+        "matched_by_name": matched_name,
+        "unmatched": unmatched,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    })
+
+    await log_sync("agent_matching", "success", result)
+    logger.info(f"Agent matching complete: {matched_npn} NPN, {matched_name} name, {unmatched} unmatched")
+    return result
+
+
+async def match_agents_background() -> dict:
+    """Fire-and-forget agent matching — returns immediately, runs in background."""
+    if _matching_progress.get("status") == "running":
+        return {"status": "already_running", "message": "Agent matching is already in progress"}
+
+    task = asyncio.create_task(run_agent_matching())
+    _background_tasks["matching"] = task
+    return {"status": "started", "message": "Agent matching started in background"}
+
+
+def get_matching_status() -> dict:
+    """Return current matching progress snapshot."""
+    return dict(_matching_progress)
 
 
 # ─── XML Request Builder ─────────────────────────────────────────────────────
@@ -242,8 +507,8 @@ def parse_agents(xml_root: ET.Element) -> list:
             agents.append({
                 "smartoffice_id": smartoffice_id,
                 "smartoffice_raw_id": raw_id,
-                "last_name": contact.findtext("LastName", "").strip(),
-                "first_name": contact.findtext("FirstName", "").strip(),
+                "last_name": normalize_name(contact.findtext("LastName", "")),
+                "first_name": normalize_name(contact.findtext("FirstName", "")),
                 "npn": contact.findtext("NPN", "").strip(),
                 "contact_type": contact.findtext("ContactType", ""),
                 "synced_at": datetime.now(timezone.utc).isoformat(),
@@ -274,9 +539,9 @@ def parse_production(xml_root: ET.Element) -> list:
                 "smartoffice_id": smartoffice_id,
                 "smartoffice_raw_id": raw_id,
                 "policy_number": policy.findtext("PolicyNumber", "").strip(),
-                "carrier_name": policy.findtext("CarrierName", "").strip(),
+                "carrier_name": normalize_name(policy.findtext("CarrierName", "")),
                 "annual_premium": policy.findtext("AnnualPremium", "0").strip(),
-                "insured_name": policy.findtext("InsuredName", "").strip(),
+                "insured_name": normalize_name(policy.findtext("InsuredName", "")),
                 "synced_at": datetime.now(timezone.utc).isoformat(),
                 "source": "smartoffice"
             })
@@ -502,12 +767,23 @@ async def sync_agents() -> dict:
         return {"status": "already_running", "message": "Agent sync is already in progress"}
 
     async with _sync_locks["agents"]:
-        return await _paginated_sync(
+        result = await _paginated_sync(
             sync_type="agents",
             build_xml_fn=build_agent_search_xml,
             parse_fn=parse_agents,
             collection_name="zinnia_agents",
         )
+
+        # Auto-run matching after successful agent sync
+        if result.get("status") == "success":
+            try:
+                match_result = await run_agent_matching()
+                result["matching"] = match_result
+            except Exception as e:
+                logger.error(f"Auto-matching failed after agent sync: {e}")
+                result["matching"] = {"status": "failed", "error": str(e)}
+
+        return result
 
 
 async def sync_production() -> dict:

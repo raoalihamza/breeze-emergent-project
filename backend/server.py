@@ -46,7 +46,7 @@ from atlas_ai_service import get_atlas_ai_response, process_uploaded_document, s
 from zinnia_service import (
     sync_all, sync_agents, sync_production,
     sync_case_status, start_scheduler,
-    get_sync_status,
+    get_sync_status, match_agents_background, get_matching_status,
     set_db as set_zinnia_db
 )
 
@@ -6352,6 +6352,72 @@ async def get_zinnia_production(current_user: dict = Depends(get_current_user)):
         {}, {'_id': 0}
     ).to_list(1000)
     return data
+
+@api_router.post("/zinnia/match/agents")
+async def trigger_agent_matching(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    return await match_agents_background()
+
+@api_router.get("/zinnia/match/status")
+async def get_agent_matching_status(current_user: dict = Depends(get_current_user)):
+    await require_role(current_user, ['admin'])
+    return get_matching_status()
+
+@api_router.get("/zinnia/unmatched")
+async def get_unmatched_agents(
+    page: int = 1,
+    page_size: int = 25,
+    search: str = "",
+    current_user: dict = Depends(get_current_user)
+):
+    await require_role(current_user, ['admin'])
+    query = {}
+    if search:
+        query["$or"] = [
+            {"first_name": {"$regex": search, "$options": "i"}},
+            {"last_name": {"$regex": search, "$options": "i"}},
+            {"npn": {"$regex": search, "$options": "i"}},
+        ]
+    total = await db.zinnia_unmatched.count_documents(query)
+    skip = (page - 1) * page_size
+    records = await db.zinnia_unmatched.find(
+        query, {'_id': 0}
+    ).skip(skip).limit(page_size).to_list(page_size)
+    return {
+        "data": records,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
+    }
+
+@api_router.get("/zinnia/matched")
+async def get_matched_agents(
+    page: int = 1,
+    page_size: int = 25,
+    search: str = "",
+    current_user: dict = Depends(get_current_user)
+):
+    await require_role(current_user, ['admin'])
+    query = {"atlas_user_id": {"$exists": True}}
+    if search:
+        query["$or"] = [
+            {"first_name": {"$regex": search, "$options": "i"}},
+            {"last_name": {"$regex": search, "$options": "i"}},
+            {"npn": {"$regex": search, "$options": "i"}},
+        ]
+    total = await db.zinnia_agents.count_documents(query)
+    skip = (page - 1) * page_size
+    records = await db.zinnia_agents.find(
+        query, {'_id': 0}
+    ).skip(skip).limit(page_size).to_list(page_size)
+    return {
+        "data": records,
+        "total": total,
+        "page": page,
+        "page_size": page_size,
+        "total_pages": (total + page_size - 1) // page_size,
+    }
 
 # Include router and middleware AFTER all routes are defined
 app.include_router(api_router)
