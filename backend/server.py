@@ -45,7 +45,7 @@ from email_service import (
 from atlas_ai_service import get_atlas_ai_response, process_uploaded_document, set_db as set_atlas_db
 from zinnia_service import (
     sync_all, sync_agents, sync_production,
-    sync_case_status, start_scheduler,
+    sync_case_status, start_all_schedulers,
     get_sync_status, match_agents_background, get_matching_status,
     set_db as set_zinnia_db
 )
@@ -5618,9 +5618,22 @@ async def set_portal_client_email(client_id: str, data: dict, current_user: dict
 async def startup_db():
     # Set the database instance for atlas_ai_service
     set_atlas_db(db)
-    
     set_zinnia_db(db)
-    asyncio.create_task(start_scheduler(interval_minutes=180))
+
+    # ── Zinnia MongoDB indexes ──────────────────────────────────────────────────
+    await db.zinnia_agents.create_index("smartoffice_id", unique=True, background=True)
+    await db.zinnia_agents.create_index("npn", background=True)
+    await db.zinnia_agents.create_index("name", background=True)
+    await db.zinnia_unmatched.create_index("smartoffice_id", unique=True, background=True)
+    await db.zinnia_unmatched.create_index([("reviewed", 1), ("dismissed", 1)], background=True)
+    await db.zinnia_matched.create_index("smartoffice_id", unique=True, background=True)
+    await db.zinnia_matched.create_index("atlas_user_id", background=True)
+    await db.zinnia_matched.create_index("match_type", background=True)
+    await db.zinnia_sync_logs.create_index([("timestamp", -1)], background=True)
+    await db.zinnia_sync_logs.create_index([("status", 1), ("timestamp", -1)], background=True)
+    logger.info("Zinnia MongoDB indexes ensured")
+
+    asyncio.create_task(start_all_schedulers())
     
     admin_exists = await db.users.find_one({'email': 'kyle@breezewealthmanagement.com'})
     if not admin_exists:
@@ -6305,9 +6318,28 @@ async def get_question_analytics(current_user: dict = Depends(get_current_user))
 
 @api_router.post("/zinnia/sync")
 async def trigger_zinnia_sync(current_user: dict = Depends(get_current_user)):
+    """Legacy endpoint — kept for compatibility."""
     await require_role(current_user, ['admin'])
     result = await sync_all()
     return result
+
+@api_router.post("/zinnia/sync/deep")
+async def deep_sync(current_user: dict = Depends(get_current_user)):
+    """Fire-and-forget full SmartOffice re-sync. Returns immediately."""
+    await require_role(current_user, ['admin'])
+    from zinnia_service import _sync_locks
+    running = [t for t in _sync_locks if _sync_locks[t].locked()]
+    if running:
+        return {
+            "status": "already_running",
+            "message": f"Sync already in progress: {', '.join(running)}"
+        }
+    asyncio.create_task(sync_all())
+    return {
+        "status": "started",
+        "estimated_minutes": 45,
+        "message": "Deep sync started in background. Estimated time: 30–60 minutes."
+    }
 
 @api_router.get("/zinnia/sync/agents")
 async def sync_zinnia_agents(current_user: dict = Depends(get_current_user)):
@@ -6330,11 +6362,19 @@ async def zinnia_sync_status(current_user: dict = Depends(get_current_user)):
     return await get_sync_status()
 
 @api_router.get("/zinnia/logs")
-async def get_zinnia_logs(current_user: dict = Depends(get_current_user)):
+async def get_zinnia_logs(
+    since: str = "2025-11-01T00:00:00",
+    status: str = "",
+    limit: int = 100,
+    current_user: dict = Depends(get_current_user)
+):
     await require_role(current_user, ['admin'])
+    query = {"timestamp": {"$gte": since}}
+    if status:
+        query["status"] = status
     logs = await db.zinnia_sync_logs.find(
-        {}, {'_id': 0}
-    ).sort("timestamp", -1).limit(50).to_list(50)
+        query, {'_id': 0}
+    ).sort("timestamp", -1).limit(limit).to_list(limit)
     return logs
 
 @api_router.get("/zinnia/agents")
@@ -6418,6 +6458,79 @@ async def get_matched_agents(
         "page_size": page_size,
         "total_pages": (total + page_size - 1) // page_size,
     }
+
+@api_router.post("/zinnia/unmatched/{smartoffice_id}/match")
+async def manual_match_agent(
+    smartoffice_id: str,
+    data: dict,
+    current_user: dict = Depends(get_current_user)
+):
+    await require_role(current_user, ['admin'])
+    atlas_user_id = data.get("atlas_user_id")
+    if not atlas_user_id:
+        raise HTTPException(status_code=400, detail="atlas_user_id is required")
+
+    unmatched = await db.zinnia_unmatched.find_one({"smartoffice_id": smartoffice_id}, {'_id': 0})
+    if not unmatched:
+        raise HTTPException(status_code=404, detail="Unmatched record not found")
+
+    atlas_user = await db.users.find_one({"id": atlas_user_id}, {'_id': 0})
+    if not atlas_user:
+        raise HTTPException(status_code=404, detail="Atlas user not found")
+
+    now = datetime.now(timezone.utc).isoformat()
+    await db.zinnia_agents.update_one(
+        {"smartoffice_id": smartoffice_id},
+        {"$set": {
+            "atlas_user_id": atlas_user_id,
+            "match_type": "manual",
+            "matched_at": now,
+            "matched_by": current_user["id"],
+        }},
+        upsert=True
+    )
+    await db.zinnia_unmatched.delete_one({"smartoffice_id": smartoffice_id})
+    return {"status": "matched", "atlas_user_id": atlas_user_id, "match_type": "manual"}
+
+
+@api_router.post("/zinnia/unmatched/{smartoffice_id}/dismiss")
+async def dismiss_unmatched_agent(
+    smartoffice_id: str,
+    current_user: dict = Depends(get_current_user)
+):
+    await require_role(current_user, ['admin'])
+    result = await db.zinnia_unmatched.update_one(
+        {"smartoffice_id": smartoffice_id},
+        {"$set": {
+            "reviewed": True,
+            "dismissed": True,
+            "dismissed_at": datetime.now(timezone.utc).isoformat(),
+            "dismissed_by": current_user["id"],
+        }}
+    )
+    if result.matched_count == 0:
+        raise HTTPException(status_code=404, detail="Unmatched record not found")
+    return {"status": "dismissed"}
+
+
+@api_router.get("/zinnia/users/search")
+async def search_atlas_users_for_zinnia(
+    q: str = "",
+    current_user: dict = Depends(get_current_user)
+):
+    await require_role(current_user, ['admin'])
+    query = {}
+    if q:
+        query = {"$or": [
+            {"name": {"$regex": q, "$options": "i"}},
+            {"npn": {"$regex": q, "$options": "i"}},
+        ]}
+    users = await db.users.find(
+        query,
+        {'_id': 0, 'id': 1, 'name': 1, 'email': 1, 'npn': 1}
+    ).limit(20).to_list(20)
+    return users
+
 
 # Include router and middleware AFTER all routes are defined
 app.include_router(api_router)

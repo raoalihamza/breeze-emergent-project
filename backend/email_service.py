@@ -1063,3 +1063,53 @@ async def send_contracting_instructions_email(to: str, first_name: str) -> Dict[
         text=email_data["text"],
         tags=[{"name": "category", "value": "contracting_instructions"}]
     )
+
+
+# ============================================
+# Zinnia Sync Failure Email
+# ============================================
+
+SYNC_ALERT_RECIPIENTS = [
+    "kyle@breezewealthmanagement.com",
+    "bb@breezewealthmanagement.com",
+]
+
+async def send_sync_failure_email(
+    to: str,
+    sync_type: str,
+    error: str,
+    timestamp: str
+) -> Dict[str, Any]:
+    """Send sync failure alert email to admins"""
+    subject = f"[Atlas] Zinnia Sync Failed — {sync_type}"
+    html = f"""
+    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto; background: #0f172a; color: #e2e8f0; padding: 32px; border-radius: 12px;">
+        <div style="border-left: 4px solid #ef4444; padding-left: 16px; margin-bottom: 24px;">
+            <h2 style="margin: 0 0 4px; color: #f87171; font-size: 20px;">Zinnia Sync Failure Alert</h2>
+            <p style="margin: 0; color: #94a3b8; font-size: 14px;">An automated sync job has failed and requires attention.</p>
+        </div>
+        <table style="width: 100%; border-collapse: collapse;">
+            <tr>
+                <td style="padding: 10px 0; border-bottom: 1px solid #1e293b; color: #94a3b8; font-size: 13px; width: 140px;">Sync Type</td>
+                <td style="padding: 10px 0; border-bottom: 1px solid #1e293b; color: #e2e8f0; font-size: 13px; font-weight: 600; text-transform: capitalize;">{sync_type}</td>
+            </tr>
+            <tr>
+                <td style="padding: 10px 0; border-bottom: 1px solid #1e293b; color: #94a3b8; font-size: 13px;">Error</td>
+                <td style="padding: 10px 0; border-bottom: 1px solid #1e293b; color: #fca5a5; font-size: 13px;">{error}</td>
+            </tr>
+            <tr>
+                <td style="padding: 10px 0; color: #94a3b8; font-size: 13px;">Timestamp</td>
+                <td style="padding: 10px 0; color: #e2e8f0; font-size: 13px;">{timestamp}</td>
+            </tr>
+        </table>
+        <p style="margin: 24px 0 0; color: #64748b; font-size: 12px;">Log in to Atlas and navigate to the Zinnia Admin panel to review failed syncs and retry.</p>
+    </div>
+    """
+    text = f"Zinnia Sync Failure\nSync Type: {sync_type}\nError: {error}\nTimestamp: {timestamp}"
+    return await send_transactional_email(
+        to=SYNC_ALERT_RECIPIENTS,
+        subject=subject,
+        html=html,
+        text=text,
+        tags=[{"name": "category", "value": "zinnia_sync_failure"}]
+    )

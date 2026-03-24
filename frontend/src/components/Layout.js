@@ -20,7 +20,8 @@ import {
   Shield,
   UserCircle,
   FileText,
-  Ticket
+  Ticket,
+  Database
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'framer-motion';
 
@@ -54,7 +55,8 @@ export default function Layout({ children }) {
   const adminNavigation = user?.role === 'admin' 
     ? [
         { name: 'Manage Tickets', href: '/admin-tickets', icon: Ticket },
-        { name: 'Audit Log', href: '/audit-log', icon: Shield }
+        { name: 'Audit Log', href: '/audit-log', icon: Shield },
+        { name: 'Zinnia', href: '/zinnia-admin', icon: Database }
       ]
     : [];
 

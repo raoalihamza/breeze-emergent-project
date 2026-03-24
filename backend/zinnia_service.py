@@ -10,6 +10,7 @@ Zinnia SmartOffice Integration Service
 
 import os
 import re
+import math
 import httpx
 import asyncio
 import logging
@@ -20,6 +21,7 @@ from dotenv import load_dotenv
 import uuid
 import xml.etree.ElementTree as ET
 from pymongo import UpdateOne
+from email_service import send_sync_failure_email
 
 load_dotenv()
 
@@ -59,6 +61,13 @@ _matching_progress = {
     "started_at": None,
     "completed_at": None,
     "error": None,
+}
+
+# Per-type sync progress (updated live during _paginated_sync)
+_sync_progress = {
+    "agents":     {"current_page": 0, "total_pages": 0, "api_total": 0, "percent": 0},
+    "production": {"current_page": 0, "total_pages": 0, "api_total": 0, "percent": 0},
+    "cases":      {"current_page": 0, "total_pages": 0, "api_total": 0, "percent": 0},
 }
 
 MAX_RETRIES = 3
@@ -637,6 +646,17 @@ async def log_sync(sync_type: str, status: str, details: dict):
     except Exception as e:
         logger.error(f"Error logging sync: {str(e)}")
 
+    if status == "failed":
+        try:
+            asyncio.create_task(send_sync_failure_email(
+                to="kyle@breezewealthmanagement.com",
+                sync_type=sync_type,
+                error=details.get("error", "Unknown error"),
+                timestamp=log_entry["timestamp"]
+            ))
+        except Exception as e:
+            logger.error(f"Error sending sync failure email: {str(e)}")
+
 
 async def get_sync_state(sync_type: str) -> Optional[dict]:
     """Get the sync state for a given type from MongoDB"""
@@ -669,6 +689,10 @@ async def _paginated_sync(
     Memory-efficient — never holds more than 1 page (100 records) in memory.
     """
     logger.info(f"Starting {sync_type} sync from SmartOffice...")
+
+    # Reset progress
+    if sync_type in _sync_progress:
+        _sync_progress[sync_type] = {"current_page": 0, "total_pages": 0, "api_total": 0, "percent": 0}
 
     total_fetched = 0
     total_upserted = 0
@@ -716,12 +740,27 @@ async def _paginated_sync(
             total_modified += result.get("modified", 0)
 
         more = search_elem.get("more", "false")
-        api_total = search_elem.get("total", "?")
+        api_total_str = search_elem.get("total", "0")
+
+        # Update live progress
+        if sync_type in _sync_progress:
+            try:
+                api_total_int = int(api_total_str) if api_total_str != "?" else 0
+                total_pages_est = math.ceil(api_total_int / PAGE_SIZE) if api_total_int > 0 else 0
+                pct = round((page / total_pages_est) * 100, 1) if total_pages_est > 0 else 0
+                _sync_progress[sync_type] = {
+                    "current_page": page,
+                    "total_pages": total_pages_est,
+                    "api_total": api_total_int,
+                    "percent": pct,
+                }
+            except Exception:
+                pass
 
         if page % 50 == 0 or more != "true":
             logger.info(
                 f"{sync_type} page {page}: +{page_count} records, "
-                f"total fetched: {total_fetched}/{api_total}, more: {more}"
+                f"total fetched: {total_fetched}/{api_total_str}, more: {more}"
             )
 
         if more != "true" or page_count == 0:
@@ -850,33 +889,122 @@ async def sync_all() -> dict:
 
 
 async def get_sync_status() -> dict:
-    """Get current sync status for all types"""
+    """Get current sync status for all types including live progress."""
+    collection_map = {
+        "agents": "zinnia_agents",
+        "production": "zinnia_production",
+        "cases": "zinnia_cases",
+    }
     status = {}
-    for sync_type in ["agents", "production", "cases"]:
+    for sync_type, collection_name in collection_map.items():
         state = await get_sync_state(sync_type)
         is_running = _sync_locks[sync_type].locked()
+        # estimated_document_count is O(1) — uses collection metadata, not a full scan
+        db_count = await db[collection_name].estimated_document_count() if db is not None else 0
         status[sync_type] = {
             "is_running": is_running,
             "initial_sync_done": state.get("initial_sync_done", False) if state else False,
             "last_sync_time": state.get("last_sync_time") if state else None,
-            "total_records": state.get("total_records", 0) if state else 0,
+            "total_records": db_count,
+            "last_sync_fetched": state.get("total_records", 0) if state else 0,
+            "progress": _sync_progress.get(sync_type, {}) if is_running else {},
         }
     return status
 
 
 # ─── Scheduler ───────────────────────────────────────────────────────────────
 
-async def start_scheduler(interval_minutes: int = 180):
-    """Run sync every 3 hours automatically.
-    First run triggers immediately on startup.
+async def _run_with_retry(sync_fn, sync_type: str, max_attempts: int = 3):
+    """Run a sync function with exponential-backoff retry.
+    Attempt 1: immediate
+    Attempt 2: wait 5 min
+    Attempt 3: wait 10 min
+    All attempts failed → log + email alert.
     """
-    logger.info(f"Zinnia sync scheduler started — runs every {interval_minutes} minutes")
-
-    while True:
+    for attempt in range(1, max_attempts + 1):
         try:
-            await sync_all()
+            result = await sync_fn()
+            if result.get("status") in ("success", "already_running"):
+                return result
+            raise Exception(result.get("error", "Sync returned non-success status"))
         except Exception as e:
-            logger.error(f"Scheduler sync error: {str(e)}")
-            await log_sync("scheduler", "failed", {"error": str(e)})
+            logger.error(f"{sync_type} cron attempt {attempt}/{max_attempts} failed: {e}")
+            if attempt < max_attempts:
+                wait_min = attempt * 5
+                logger.info(f"Retrying {sync_type} cron in {wait_min} min...")
+                await asyncio.sleep(wait_min * 60)
+            else:
+                logger.error(f"{sync_type} cron failed after {max_attempts} attempts — alerting admin")
+                await log_sync(f"{sync_type}_cron", "failed", {
+                    "error": str(e), "attempts": max_attempts
+                })
+                try:
+                    asyncio.create_task(send_sync_failure_email(
+                        to="kyle@breezewealthmanagement.com",
+                        sync_type=f"{sync_type} (cron — all {max_attempts} retries failed)",
+                        error=str(e),
+                        timestamp=datetime.now(timezone.utc).isoformat()
+                    ))
+                except Exception:
+                    pass
 
-        await asyncio.sleep(interval_minutes * 60)
+
+async def _seconds_until_next_3am_utc() -> float:
+    """Seconds until the next 3:00 AM UTC."""
+    now = datetime.now(timezone.utc)
+    target = now.replace(hour=3, minute=0, second=0, microsecond=0)
+    if now >= target:
+        target = target.replace(day=target.day + 1)
+    return (target - now).total_seconds()
+
+
+async def _agents_scheduler():
+    """Agents sync every 6 hours (with retry)."""
+    logger.info("Agents scheduler started — every 6 hours")
+    while True:
+        await _run_with_retry(sync_agents, "agents")
+        await asyncio.sleep(6 * 60 * 60)
+
+
+async def _production_scheduler():
+    """Production sync every 1 hour (with retry). Staggered 2 min after server start."""
+    logger.info("Production scheduler started — every 1 hour")
+    await asyncio.sleep(2 * 60)
+    while True:
+        await _run_with_retry(sync_production, "production")
+        await asyncio.sleep(60 * 60)
+
+
+async def _cases_scheduler():
+    """Cases sync every 30 minutes (with retry). Staggered 4 min after server start."""
+    logger.info("Cases scheduler started — every 30 minutes")
+    await asyncio.sleep(4 * 60)
+    while True:
+        await _run_with_retry(sync_case_status, "cases")
+        await asyncio.sleep(30 * 60)
+
+
+async def _reconciliation_scheduler():
+    """Full reconciliation sync daily at 3 AM UTC."""
+    logger.info("Reconciliation scheduler started — daily at 3 AM UTC")
+    while True:
+        wait = await _seconds_until_next_3am_utc()
+        logger.info(f"Reconciliation: next run in {wait/3600:.1f} hours")
+        await asyncio.sleep(wait)
+        await _run_with_retry(sync_all, "reconciliation")
+
+
+async def start_all_schedulers():
+    """Start all per-type cron schedulers concurrently."""
+    logger.info("Starting all Zinnia cron schedulers")
+    await asyncio.gather(
+        _agents_scheduler(),
+        _production_scheduler(),
+        _cases_scheduler(),
+        _reconciliation_scheduler(),
+    )
+
+
+# Keep for backward compatibility
+async def start_scheduler(interval_minutes: int = 180):
+    await start_all_schedulers()

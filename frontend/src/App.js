@@ -23,6 +23,7 @@ import Profile from './pages/Profile';
 import BookOfBusiness from './pages/BookOfBusiness';
 import MyClients from './pages/MyClients';
 import AuditLog from './pages/AuditLog';
+import ZinniaAdmin from './pages/ZinniaAdmin';
 import MyTickets from './pages/MyTickets';
 import AdminTickets from './pages/AdminTickets';
 import Layout from './components/Layout';
@@ -85,7 +86,8 @@ function App() {
               <Route path="/audit-log" element={<ProtectedRoute><AuditLog /></ProtectedRoute>} />
               <Route path="/my-tickets" element={<ProtectedRoute><MyTickets /></ProtectedRoute>} />
               <Route path="/admin-tickets" element={<ProtectedRoute><AdminTickets /></ProtectedRoute>} />
-              
+              <Route path="/zinnia-admin" element={<ProtectedRoute><ZinniaAdmin /></ProtectedRoute>} />
+
               {/* Client Portal Routes */}
               <Route path="/client-portal/login" element={<ClientLogin />} />
               <Route path="/client-portal/setup/:token" element={<ClientSetPassword />} />
