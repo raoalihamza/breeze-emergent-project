@@ -742,7 +742,10 @@ async def _paginated_sync(
             try:
                 api_total_int = int(api_total_str) if api_total_str != "?" else 0
                 total_pages_est = math.ceil(api_total_int / PAGE_SIZE) if api_total_int > 0 else 0
-                pct = round(((page + 1) / total_pages_est) * 100, 1) if total_pages_est > 0 else 0
+                # If current page exceeds estimate (API returned wrong total), extend estimate
+                if total_pages_est > 0 and page >= total_pages_est:
+                    total_pages_est = page + 10
+                pct = min(round(((page + 1) / total_pages_est) * 100, 1), 99.0) if total_pages_est > 0 else 0
                 _sync_progress[sync_type] = {
                     "current_page": page,
                     "total_pages": total_pages_est,
