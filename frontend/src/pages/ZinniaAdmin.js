@@ -75,6 +75,8 @@ export default function ZinniaAdmin() {
   const [logsLoading, setLogsLoading] = useState(true);
   const [deepSyncDialogOpen, setDeepSyncDialogOpen] = useState(false);
   const [deepSyncing, setDeepSyncing] = useState(false);
+  const [matchingStatus, setMatchingStatus] = useState(null);
+  const [runningMatch, setRunningMatch] = useState(false);
 
   // ── Failed Syncs Tab ───────────────────────────────────────────────────────
   const [failedLogs, setFailedLogs] = useState([]);
@@ -120,6 +122,15 @@ export default function ZinniaAdmin() {
         headers: getAuthHeader().headers,
       });
       if (res.ok) setSyncStatus(await res.json());
+    } catch {}
+  }, [getAuthHeader]);
+
+  const fetchMatchingStatus = useCallback(async () => {
+    try {
+      const res = await fetch(`${API}/zinnia/match/status`, {
+        headers: getAuthHeader().headers,
+      });
+      if (res.ok) setMatchingStatus(await res.json());
     } catch {}
   }, [getAuthHeader]);
 
@@ -201,6 +212,12 @@ export default function ZinniaAdmin() {
     fetchFailedLogs();
     fetchUnmatched(1, '');
     fetchMatched(1, '');
+    fetchMatchingStatus();
+    return () => {
+      clearTimeout(searchDebounceRef.current);
+      clearTimeout(matchedSearchDebounceRef.current);
+      clearTimeout(userSearchDebounceRef.current);
+    };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Adaptive polling: 5s when syncing, 30s when idle ──────────────────────
@@ -252,6 +269,30 @@ export default function ZinniaAdmin() {
   const handleRetry = async () => {
     await Promise.all([fetchFailedLogs(), fetchLogs(), fetchSyncStatus()]);
     toast.success('Data refreshed from database');
+  };
+
+  // ── Run Matching (DB only — no SmartOffice call) ───────────────────────────
+  const handleRunMatching = async () => {
+    setRunningMatch(true);
+    try {
+      const res = await fetch(`${API}/zinnia/match/agents`, {
+        method: 'POST',
+        headers: getAuthHeader().headers,
+      });
+      const data = await res.json();
+      if (res.ok && data.status === 'started') {
+        toast.success('Agent matching started in background');
+        await fetchMatchingStatus();
+      } else if (data.status === 'already_running') {
+        toast.error('Matching is already in progress');
+      } else {
+        toast.error('Failed to start matching');
+      }
+    } catch {
+      toast.error('Failed to start matching');
+    } finally {
+      setRunningMatch(false);
+    }
   };
 
   // ── Unmatched search / pagination ─────────────────────────────────────────
@@ -481,7 +522,12 @@ export default function ZinniaAdmin() {
         <TabsContent value="sync-status" className="mt-4 space-y-4">
 
           {/* Stat Cards */}
-          <div className="grid grid-cols-3 gap-3 items-stretch" style={{ gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}>
+          {!syncStatus && (
+            <div className="flex items-center justify-center py-10">
+              <div className="animate-spin rounded-full h-6 w-6 border-2 border-cyan-500 border-t-transparent" />
+            </div>
+          )}
+          {syncStatus && <div className="grid grid-cols-3 gap-3 items-stretch" style={{ gridTemplateColumns: 'repeat(3, minmax(0, 1fr))' }}>
             {[
               { type: 'agents',     label: 'Agents',     icon: Users },
               { type: 'production', label: 'Policies',   icon: FileText },
@@ -558,7 +604,43 @@ export default function ZinniaAdmin() {
                 </motion.div>
               );
             })}
-          </div>
+          </div>}
+
+          {/* Matching Status Card */}
+          <Card className="border-slate-200/80 dark:border-slate-800/50 bg-white dark:bg-slate-900/50">
+            <CardContent className="p-4">
+              <div className="flex items-center justify-between">
+                <div className="flex items-center gap-3">
+                  <div className={`p-1.5 rounded-lg ${matchingStatus?.status === 'running' ? 'bg-violet-500/20' : 'bg-violet-50 dark:bg-violet-950/30'}`}>
+                    <UserCheck className={`h-3.5 w-3.5 ${matchingStatus?.status === 'running' ? 'text-violet-400 animate-pulse' : 'text-violet-500 dark:text-violet-400'}`} />
+                  </div>
+                  <div>
+                    <p className="text-sm font-medium text-slate-900 dark:text-white">Agent Matching</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">
+                      {matchingStatus?.status === 'running'
+                        ? `Running... ${matchingStatus.total_processed?.toLocaleString() ?? 0} processed`
+                        : matchingStatus?.status === 'complete'
+                        ? `Last run: ${matchingStatus.matched_by_npn ?? 0} NPN · ${matchingStatus.matched_by_name ?? 0} name · ${matchingStatus.unmatched ?? 0} unmatched`
+                        : 'Links SmartOffice agents to Atlas users (DB only)'}
+                    </p>
+                  </div>
+                </div>
+                <Button
+                  size="sm"
+                  variant="outline"
+                  onClick={handleRunMatching}
+                  disabled={runningMatch || matchingStatus?.status === 'running'}
+                  className="h-8 text-xs border-violet-500/40 text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
+                >
+                  {runningMatch || matchingStatus?.status === 'running' ? (
+                    <><RefreshCw className="h-3 w-3 mr-1.5 animate-spin" /> Running...</>
+                  ) : (
+                    <><UserCheck className="h-3 w-3 mr-1.5" /> Run Matching</>
+                  )}
+                </Button>
+              </div>
+            </CardContent>
+          </Card>
 
           {/* Sync History Table */}
           <Card className="border-slate-200/80 dark:border-slate-800/50 bg-white dark:bg-slate-900/50">

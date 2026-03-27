@@ -14,7 +14,7 @@ import math
 import httpx
 import asyncio
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Optional
 from difflib import SequenceMatcher
 from dotenv import load_dotenv
@@ -28,7 +28,7 @@ load_dotenv()
 logger = logging.getLogger(__name__)
 
 # ─── Zinnia API Config ────────────────────────────────────────────────────────
-ZINNIA_API_URL = "https://api.sandbox.smartofficecrm.com/bwm/v1/send"
+ZINNIA_API_URL = os.environ.get("ZINNIA_API_URL", "https://api.sandbox.smartofficecrm.com/bwm/v1/send")
 ZINNIA_SITE_NAME = os.environ.get("ZINNIA_SITE_NAME", "PREPRODNEW")
 ZINNIA_USERNAME = os.environ.get("ZINNIA_USERNAME", "PREPRODNEW_SDC_UAT_bbrandon")
 ZINNIA_API_KEY = os.environ.get("ZINNIA_API_KEY", "")
@@ -335,17 +335,12 @@ def get_matching_status() -> dict:
 # ─── XML Request Builder ─────────────────────────────────────────────────────
 
 def build_headers():
-    """Build SmartOffice API headers"""
-    api_key = os.environ.get("ZINNIA_API_KEY") or "328ab6e47a8044e38153c0b808a552db"
-    api_secret = os.environ.get("ZINNIA_API_SECRET") or "ioOOq96XPkRkV1JejgWOkPAt54cg9ZRm"
-    site_name = os.environ.get("ZINNIA_SITE_NAME") or "PREPRODNEW"
-    username = os.environ.get("ZINNIA_USERNAME") or "PREPRODNEW_SDC_UAT_bbrandon"
-
+    """Build SmartOffice API headers — all values from environment variables"""
     return {
-        "sitename": site_name,
-        "username": username,
-        "api-key": api_key,
-        "api-secret": api_secret,
+        "sitename": ZINNIA_SITE_NAME,
+        "username": ZINNIA_USERNAME,
+        "api-key": ZINNIA_API_KEY,
+        "api-secret": ZINNIA_API_SECRET,
         "Content-Type": "application/xml"
     }
 
@@ -747,7 +742,7 @@ async def _paginated_sync(
             try:
                 api_total_int = int(api_total_str) if api_total_str != "?" else 0
                 total_pages_est = math.ceil(api_total_int / PAGE_SIZE) if api_total_int > 0 else 0
-                pct = round((page / total_pages_est) * 100, 1) if total_pages_est > 0 else 0
+                pct = round(((page + 1) / total_pages_est) * 100, 1) if total_pages_est > 0 else 0
                 _sync_progress[sync_type] = {
                     "current_page": page,
                     "total_pages": total_pages_est,
@@ -813,16 +808,14 @@ async def sync_agents() -> dict:
             collection_name="zinnia_agents",
         )
 
-        # Auto-run matching after successful agent sync
-        if result.get("status") == "success":
-            try:
-                match_result = await run_agent_matching()
-                result["matching"] = match_result
-            except Exception as e:
-                logger.error(f"Auto-matching failed after agent sync: {e}")
-                result["matching"] = {"status": "failed", "error": str(e)}
+    # Lock released — matching runs in background so a new sync can start immediately
+    if result.get("status") == "success":
+        task = asyncio.create_task(run_agent_matching())
+        _background_tasks["matching"] = task
+        result["matching"] = {"status": "started", "message": "Agent matching running in background"}
+        logger.info("Agent sync complete — matching started in background (lock released)")
 
-        return result
+    return result
 
 
 async def sync_production() -> dict:
@@ -954,7 +947,7 @@ async def _seconds_until_next_3am_utc() -> float:
     now = datetime.now(timezone.utc)
     target = now.replace(hour=3, minute=0, second=0, microsecond=0)
     if now >= target:
-        target = target.replace(day=target.day + 1)
+        target = target + timedelta(days=1)
     return (target - now).total_seconds()
 
 
@@ -1003,6 +996,39 @@ async def start_all_schedulers():
         _cases_scheduler(),
         _reconciliation_scheduler(),
     )
+
+
+async def health_check() -> dict:
+    """Verify SmartOffice API connectivity with a minimal request.
+    Returns status, current API URL, and response time.
+    """
+    import time
+    start = time.monotonic()
+    try:
+        xml_body = build_agent_search_xml(page=0, pagesize=1, searchid="")
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            response = await client.post(
+                ZINNIA_API_URL,
+                headers=build_headers(),
+                content=xml_body.encode("utf-8")
+            )
+            elapsed_ms = round((time.monotonic() - start) * 1000)
+            response.raise_for_status()
+            return {
+                "status": "ok",
+                "api_url": ZINNIA_API_URL,
+                "response_time_ms": elapsed_ms,
+                "http_status": response.status_code,
+            }
+    except Exception as e:
+        elapsed_ms = round((time.monotonic() - start) * 1000)
+        logger.error(f"Health check failed: {e}")
+        return {
+            "status": "error",
+            "api_url": ZINNIA_API_URL,
+            "response_time_ms": elapsed_ms,
+            "error": str(e),
+        }
 
 
 # Keep for backward compatibility

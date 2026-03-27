@@ -47,6 +47,7 @@ from zinnia_service import (
     sync_all, sync_agents, sync_production,
     sync_case_status, start_all_schedulers,
     get_sync_status, match_agents_background, get_matching_status,
+    health_check as zinnia_health_check,
     set_db as set_zinnia_db
 )
 
@@ -5626,9 +5627,8 @@ async def startup_db():
     await db.zinnia_agents.create_index("name", background=True)
     await db.zinnia_unmatched.create_index("smartoffice_id", unique=True, background=True)
     await db.zinnia_unmatched.create_index([("reviewed", 1), ("dismissed", 1)], background=True)
-    await db.zinnia_matched.create_index("smartoffice_id", unique=True, background=True)
-    await db.zinnia_matched.create_index("atlas_user_id", background=True)
-    await db.zinnia_matched.create_index("match_type", background=True)
+    await db.zinnia_agents.create_index("atlas_user_id", background=True, sparse=True)
+    await db.zinnia_agents.create_index("match_type", background=True, sparse=True)
     await db.zinnia_sync_logs.create_index([("timestamp", -1)], background=True)
     await db.zinnia_sync_logs.create_index([("status", 1), ("timestamp", -1)], background=True)
     logger.info("Zinnia MongoDB indexes ensured")
@@ -6341,17 +6341,17 @@ async def deep_sync(current_user: dict = Depends(get_current_user)):
         "message": "Deep sync started in background. Estimated time: 30–60 minutes."
     }
 
-@api_router.get("/zinnia/sync/agents")
+@api_router.post("/zinnia/sync/agents")
 async def sync_zinnia_agents(current_user: dict = Depends(get_current_user)):
     await require_role(current_user, ['admin'])
     return await sync_agents()
 
-@api_router.get("/zinnia/sync/production")
+@api_router.post("/zinnia/sync/production")
 async def sync_zinnia_production(current_user: dict = Depends(get_current_user)):
     await require_role(current_user, ['admin'])
     return await sync_production()
 
-@api_router.get("/zinnia/sync/cases")
+@api_router.post("/zinnia/sync/cases")
 async def sync_zinnia_cases(current_user: dict = Depends(get_current_user)):
     await require_role(current_user, ['admin'])
     return await sync_case_status()
@@ -6411,6 +6411,8 @@ async def get_unmatched_agents(
     current_user: dict = Depends(get_current_user)
 ):
     await require_role(current_user, ['admin'])
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
     query = {}
     if search:
         query["$or"] = [
@@ -6439,6 +6441,8 @@ async def get_matched_agents(
     current_user: dict = Depends(get_current_user)
 ):
     await require_role(current_user, ['admin'])
+    page = max(1, page)
+    page_size = max(1, min(page_size, 100))
     query = {"atlas_user_id": {"$exists": True}}
     if search:
         query["$or"] = [
@@ -6530,6 +6534,13 @@ async def search_atlas_users_for_zinnia(
         {'_id': 0, 'id': 1, 'name': 1, 'email': 1, 'npn': 1}
     ).limit(20).to_list(20)
     return users
+
+
+@api_router.get("/zinnia/health")
+async def zinnia_health(current_user: dict = Depends(get_current_user)):
+    """Health check — verifies SmartOffice API connectivity."""
+    await require_role(current_user, ['admin'])
+    return await zinnia_health_check()
 
 
 # Include router and middleware AFTER all routes are defined
