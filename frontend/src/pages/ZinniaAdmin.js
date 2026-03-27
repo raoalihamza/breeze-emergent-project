@@ -220,17 +220,23 @@ export default function ZinniaAdmin() {
     };
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Adaptive polling: 5s when syncing, 30s when idle ──────────────────────
+  // ── Adaptive polling: 5s when syncing/matching, 30s when idle ────────────
+  const anyMatchingRunning = matchingStatus?.status === 'running';
+
   useEffect(() => {
-    const interval = anySyncRunning ? 5000 : 30000;
-    const id = setInterval(fetchSyncStatus, interval);
+    const interval = (anySyncRunning || anyMatchingRunning) ? 5000 : 30000;
+    const id = setInterval(() => {
+      fetchSyncStatus();
+      fetchMatchingStatus();
+    }, interval);
     return () => clearInterval(id);
-  }, [anySyncRunning, fetchSyncStatus]);
+  }, [anySyncRunning, anyMatchingRunning, fetchSyncStatus, fetchMatchingStatus]);
 
   // ── Refresh — re-fetch everything from our DB only ─────────────────────────
   const handleRefresh = async () => {
     await Promise.all([
       fetchSyncStatus(),
+      fetchMatchingStatus(),
       fetchLogs(),
       fetchFailedLogs(),
       fetchUnmatched(unmatchedPage, unmatchedSearch),
