@@ -4,7 +4,7 @@ import axios from 'axios';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Button } from '../components/ui/button';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '../components/ui/tabs';
-import { TrendingUp, DollarSign, FileText, Users, Calendar, ChevronDown, Target, Award } from 'lucide-react';
+import { TrendingUp, DollarSign, FileText, Users, Calendar, ChevronDown, Target, Award, Building2 } from 'lucide-react';
 import { toast } from 'sonner';
 import { motion } from 'framer-motion';
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, AreaChart, Area } from 'recharts';
@@ -25,6 +25,8 @@ export default function Production() {
   const [personalData, setPersonalData] = useState(null);
   const [teamData, setTeamData] = useState(null);
   const [directLegsData, setDirectLegsData] = useState(null);
+  const [zinniaData, setZinniaData] = useState(null);
+  const [zinniaLoading, setZinniaLoading] = useState(false);
 
   useEffect(() => {
     fetchData();
@@ -34,11 +36,18 @@ export default function Production() {
     setLoading(true);
     try {
       if (activeTab === 'personal') {
-        const response = await axios.get(`${API}/production/personal`, {
-          ...getAuthHeader(),
-          params: { start_date: startDate, end_date: endDate }
-        });
+        const zinniaEndpoint = user?.role === 'admin'
+          ? `${API}/zinnia/all-production`
+          : `${API}/zinnia/my-production`;
+        const [response, zinniaRes] = await Promise.all([
+          axios.get(`${API}/production/personal`, {
+            ...getAuthHeader(),
+            params: { start_date: startDate, end_date: endDate }
+          }),
+          axios.get(zinniaEndpoint, getAuthHeader()).catch(() => ({ data: null }))
+        ]);
         setPersonalData(response.data);
+        setZinniaData(zinniaRes.data);
       } else {
         const [teamResponse, legsResponse] = await Promise.all([
           axios.get(`${API}/production/team`, {
@@ -331,6 +340,90 @@ export default function Production() {
               </CardContent>
             </Card>
           </motion.div>
+
+          {/* SmartOffice Production Data */}
+          {zinniaData !== null && (
+            <motion.div initial={{ opacity: 0, y: 10 }} animate={{ opacity: 1, y: 0 }} transition={{ delay: 0.2 }}>
+              <Card className="border-slate-200/80 dark:border-slate-800/50 bg-white dark:bg-slate-900/50">
+                <CardHeader className="pb-2 pt-4 px-4">
+                  <div className="flex items-center gap-2">
+                    <div className="p-1.5 rounded-lg bg-orange-50 dark:bg-orange-950/30">
+                      <Building2 className="h-3.5 w-3.5 text-orange-600 dark:text-orange-400" />
+                    </div>
+                    <CardTitle className="text-sm font-semibold text-slate-900 dark:text-white">SmartOffice Production</CardTitle>
+                    <span className="text-[10px] px-1.5 py-0.5 rounded bg-orange-100 dark:bg-orange-900/50 text-orange-700 dark:text-orange-300 ml-1">Zinnia</span>
+                  </div>
+                </CardHeader>
+                <CardContent className="px-4 pb-4 pt-2">
+                  {zinniaData.total_policies === 0 ? (
+                    <p className="text-sm text-slate-500 dark:text-slate-400 text-center py-4">
+                      No SmartOffice production records linked yet.
+                    </p>
+                  ) : (
+                    <>
+                      {/* AP Totals */}
+                      <div className="grid grid-cols-2 gap-3 mb-4">
+                        <div className="p-3 rounded-lg bg-cyan-50 dark:bg-cyan-950/20 border border-cyan-100 dark:border-cyan-900/30">
+                          <p className="text-[10px] font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">Submitted AP</p>
+                          <p className="text-lg font-bold text-cyan-700 dark:text-cyan-400">
+                            ${(zinniaData.submitted_ap_total ?? zinniaData.by_agent?.reduce((s, a) => s + a.submitted_ap, 0) ?? 0).toLocaleString()}
+                          </p>
+                        </div>
+                        <div className="p-3 rounded-lg bg-emerald-50 dark:bg-emerald-950/20 border border-emerald-100 dark:border-emerald-900/30">
+                          <p className="text-[10px] font-medium text-slate-500 dark:text-slate-400 uppercase tracking-wide mb-1">Issued AP</p>
+                          <p className="text-lg font-bold text-emerald-700 dark:text-emerald-400">
+                            ${(zinniaData.issued_ap_total ?? zinniaData.by_agent?.reduce((s, a) => s + a.issued_ap, 0) ?? 0).toLocaleString()}
+                          </p>
+                        </div>
+                      </div>
+
+                      {/* Policies Table */}
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-xs">
+                          <thead>
+                            <tr className="border-b border-slate-200 dark:border-slate-700">
+                              {user?.role === 'admin' && (
+                                <th className="text-left py-2 px-2 text-slate-500 dark:text-slate-400 font-medium">Agent Name</th>
+                              )}
+                              <th className="text-left py-2 px-2 text-slate-500 dark:text-slate-400 font-medium">Insured Name</th>
+                              <th className="text-left py-2 px-2 text-slate-500 dark:text-slate-400 font-medium">Carrier</th>
+                              <th className="text-right py-2 px-2 text-slate-500 dark:text-slate-400 font-medium">Annual Premium</th>
+                              <th className="text-center py-2 px-2 text-slate-500 dark:text-slate-400 font-medium">Status</th>
+                              <th className="text-left py-2 px-2 text-slate-500 dark:text-slate-400 font-medium">Policy #</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {zinniaData.policies.map((p, i) => (
+                              <tr key={p.smartoffice_id || i} className="border-b border-slate-100 dark:border-slate-800 hover:bg-slate-50 dark:hover:bg-slate-800/50">
+                                {user?.role === 'admin' && (
+                                  <td className="py-2 px-2 text-slate-600 dark:text-slate-300">{p.atlas_agent_name || '—'}</td>
+                                )}
+                                <td className="py-2 px-2 text-slate-900 dark:text-white font-medium">{p.insured_name || '—'}</td>
+                                <td className="py-2 px-2 text-slate-600 dark:text-slate-300">{p.carrier_name || '—'}</td>
+                                <td className="py-2 px-2 text-right text-slate-900 dark:text-white font-medium">
+                                  ${parseFloat(p.annual_premium || 0).toLocaleString()}
+                                </td>
+                                <td className="py-2 px-2 text-center">
+                                  <span className={`inline-block px-1.5 py-0.5 rounded text-[10px] font-medium ${
+                                    (p.status || '').toLowerCase() === 'active'
+                                      ? 'bg-emerald-100 dark:bg-emerald-900/50 text-emerald-700 dark:text-emerald-300'
+                                      : 'bg-amber-100 dark:bg-amber-900/50 text-amber-700 dark:text-amber-300'
+                                  }`}>
+                                    {p.status || '—'}
+                                  </span>
+                                </td>
+                                <td className="py-2 px-2 text-slate-500 dark:text-slate-400">{p.policy_number || '—'}</td>
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </>
+                  )}
+                </CardContent>
+              </Card>
+            </motion.div>
+          )}
         </TabsContent>
 
         {/* Team Production Tab */}

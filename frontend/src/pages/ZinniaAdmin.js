@@ -77,6 +77,7 @@ export default function ZinniaAdmin() {
   const [deepSyncing, setDeepSyncing] = useState(false);
   const [matchingStatus, setMatchingStatus] = useState(null);
   const [runningMatch, setRunningMatch] = useState(false);
+  const [runningLinkProd, setRunningLinkProd] = useState(false);
 
   // ── Failed Syncs Tab ───────────────────────────────────────────────────────
   const [failedLogs, setFailedLogs] = useState([]);
@@ -298,6 +299,27 @@ export default function ZinniaAdmin() {
       toast.error('Failed to start matching');
     } finally {
       setRunningMatch(false);
+    }
+  };
+
+  // ── Link Production to Agents ─────────────────────────────────────────────
+  const handleLinkProduction = async () => {
+    setRunningLinkProd(true);
+    try {
+      const res = await fetch(`${API}/zinnia/link/production`, {
+        method: 'POST',
+        headers: getAuthHeader().headers,
+      });
+      const data = await res.json();
+      if (res.ok) {
+        toast.success(`Matched ${data.matched_policy_number + data.matched_name_fuzzy} out of ${data.total} policies`);
+      } else {
+        toast.error('Failed to link production');
+      }
+    } catch {
+      toast.error('Failed to link production');
+    } finally {
+      setRunningLinkProd(false);
     }
   };
 
@@ -631,19 +653,34 @@ export default function ZinniaAdmin() {
                     </p>
                   </div>
                 </div>
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={handleRunMatching}
-                  disabled={runningMatch || matchingStatus?.status === 'running'}
-                  className="h-8 text-xs border-violet-500/40 text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
-                >
-                  {runningMatch || matchingStatus?.status === 'running' ? (
-                    <><RefreshCw className="h-3 w-3 mr-1.5 animate-spin" /> Running...</>
-                  ) : (
-                    <><UserCheck className="h-3 w-3 mr-1.5" /> Run Matching</>
-                  )}
-                </Button>
+                <div className="flex items-center gap-2">
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleRunMatching}
+                    disabled={runningMatch || matchingStatus?.status === 'running'}
+                    className="h-8 text-xs border-violet-500/40 text-violet-600 dark:text-violet-400 hover:bg-violet-500/10"
+                  >
+                    {runningMatch || matchingStatus?.status === 'running' ? (
+                      <><RefreshCw className="h-3 w-3 mr-1.5 animate-spin" /> Running...</>
+                    ) : (
+                      <><UserCheck className="h-3 w-3 mr-1.5" /> Run Matching</>
+                    )}
+                  </Button>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleLinkProduction}
+                    disabled={runningLinkProd}
+                    className="h-8 text-xs border-cyan-500/40 text-cyan-600 dark:text-cyan-400 hover:bg-cyan-500/10"
+                  >
+                    {runningLinkProd ? (
+                      <><RefreshCw className="h-3 w-3 mr-1.5 animate-spin" /> Linking...</>
+                    ) : (
+                      <><FileText className="h-3 w-3 mr-1.5" /> Link Production</>
+                    )}
+                  </Button>
+                </div>
               </div>
             </CardContent>
           </Card>

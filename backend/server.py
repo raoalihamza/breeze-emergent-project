@@ -48,7 +48,8 @@ from zinnia_service import (
     sync_case_status, start_all_schedulers,
     get_sync_status, match_agents_background, get_matching_status,
     health_check as zinnia_health_check,
-    set_db as set_zinnia_db
+    set_db as set_zinnia_db,
+    link_production_to_agents,
 )
 
 mongo_url = os.environ['MONGO_URL']
@@ -427,9 +428,15 @@ async def require_role(user: dict, allowed_roles: List[str]):
 @api_router.post("/auth/login", response_model=LoginResponse)
 async def login(data: LoginRequest):
     # Case-insensitive email lookup using regex
+    logger.info(f"Login attempt for email: {data.email}")
     user = await db.users.find_one({'email': {'$regex': f'^{data.email}$', '$options': 'i'}}, {'_id': 0})
-    if not user or not verify_password(data.password, user['password_hash']):
+    if not user:
+        logger.warning(f"Login failed - user not found: {data.email}")
         raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not verify_password(data.password, user['password_hash']):
+        logger.warning(f"Login failed - invalid password for: {data.email}")
+        raise HTTPException(status_code=401, detail="Invalid credentials")
+    logger.info(f"Login successful for: {data.email}")
     
     if user.get('status') == 'disabled':
         raise HTTPException(status_code=403, detail="Your account has been disabled. Please contact an administrator.")
@@ -5631,6 +5638,10 @@ async def startup_db():
     await db.zinnia_agents.create_index("match_type", background=True, sparse=True)
     await db.zinnia_sync_logs.create_index([("timestamp", -1)], background=True)
     await db.zinnia_sync_logs.create_index([("status", 1), ("timestamp", -1)], background=True)
+    await db.zinnia_production.create_index("agent_npn", background=True, sparse=True)
+    await db.zinnia_production.create_index("atlas_user_id", background=True, sparse=True)
+    await db.zinnia_production.create_index("agent_smartoffice_id", background=True, sparse=True)
+    await db.zinnia_production.create_index("smartoffice_id", unique=True, background=True)
     logger.info("Zinnia MongoDB indexes ensured")
 
     asyncio.create_task(start_all_schedulers())
@@ -6536,12 +6547,171 @@ async def search_atlas_users_for_zinnia(
     return users
 
 
+@api_router.post("/zinnia/link/production")
+async def trigger_link_production(current_user: dict = Depends(get_current_user)):
+    """Link zinnia_production records to Atlas agents via clients collection."""
+    await require_role(current_user, ['admin'])
+    return await link_production_to_agents()
+
+
+@api_router.get("/zinnia/my-production")
+async def get_my_zinnia_production(current_user: dict = Depends(get_current_user)):
+    """Get current user's SmartOffice production data linked via atlas_agent_id."""
+    user_id = current_user["id"]
+    policies = await db.zinnia_production.find(
+        {"atlas_agent_id": user_id}, {"_id": 0}
+    ).to_list(None)
+
+    submitted_ap_total = 0.0
+    issued_ap_total = 0.0
+
+    for p in policies:
+        try:
+            premium = float(p.get("annual_premium", 0))
+        except (ValueError, TypeError):
+            premium = 0.0
+        submitted_ap_total += premium
+        if (p.get("policy_status_code") or "").strip() == "1":
+            issued_ap_total += premium
+
+    return {
+        "submitted_ap_total": round(submitted_ap_total, 2),
+        "issued_ap_total": round(issued_ap_total, 2),
+        "total_policies": len(policies),
+        "policies": policies,
+    }
+
+
+@api_router.get("/zinnia/all-production")
+async def get_all_zinnia_production(current_user: dict = Depends(get_current_user)):
+    """Admin: all linked production records grouped by agent."""
+    await require_role(current_user, ['admin'])
+
+    policies = await db.zinnia_production.find(
+        {"atlas_agent_id": {"$exists": True, "$ne": ""}},
+        {"_id": 0}
+    ).to_list(None)
+
+    agent_totals: dict = {}
+    for p in policies:
+        agent_name = p.get("atlas_agent_name") or "Unknown"
+        try:
+            premium = float(p.get("annual_premium", 0))
+        except (ValueError, TypeError):
+            premium = 0.0
+        is_active = (p.get("policy_status_code") or "").strip() == "1"
+
+        if agent_name not in agent_totals:
+            agent_totals[agent_name] = {"submitted_ap": 0.0, "issued_ap": 0.0, "policy_count": 0}
+        agent_totals[agent_name]["submitted_ap"] += premium
+        if is_active:
+            agent_totals[agent_name]["issued_ap"] += premium
+        agent_totals[agent_name]["policy_count"] += 1
+
+    by_agent = [
+        {
+            "atlas_agent_name": name,
+            "submitted_ap": round(totals["submitted_ap"], 2),
+            "issued_ap": round(totals["issued_ap"], 2),
+            "policy_count": totals["policy_count"],
+        }
+        for name, totals in sorted(agent_totals.items())
+    ]
+
+    return {
+        "policies": policies,
+        "by_agent": by_agent,
+        "total_policies": len(policies),
+    }
+
+
 @api_router.get("/zinnia/health")
 async def zinnia_health(current_user: dict = Depends(get_current_user)):
     """Health check — verifies SmartOffice API connectivity."""
     await require_role(current_user, ['admin'])
     return await zinnia_health_check()
 
+
+@api_router.get("/zinnia/diagnostic")
+async def zinnia_diagnostic(current_user: dict = Depends(get_current_user)):
+    """Diagnostic endpoint — shows sample data from all collections to debug matching.
+    Returns sample raw_ids, NPN formats, and matching statistics.
+    """
+    await require_role(current_user, ['admin'])
+    from zinnia_service import normalize_npn
+
+    # Sample zinnia_production records (show raw_id format)
+    sample_production = await db.zinnia_production.find(
+        {}, {"_id": 0}
+    ).limit(5).to_list(5)
+
+    # Sample zinnia_agents records (show NPN format)
+    sample_agents = await db.zinnia_agents.find(
+        {"npn": {"$exists": True, "$ne": ""}}, {"_id": 0}
+    ).limit(5).to_list(5)
+
+    # Sample Atlas users (show NPN format)
+    sample_users = await db.users.find(
+        {}, {"_id": 0, "id": 1, "name": 1, "npn": 1, "email": 1}
+    ).limit(10).to_list(10)
+
+    # Sample Atlas clients with policy_number (for fallback matching)
+    sample_clients = await db.clients.find(
+        {"policy_number": {"$exists": True, "$ne": ""}},
+        {"_id": 0, "policy_number": 1, "agent_id": 1, "agent_name": 1, "status": 1}
+    ).limit(5).to_list(5)
+
+    # Count stats
+    total_production = await db.zinnia_production.estimated_document_count()
+    total_agents = await db.zinnia_agents.estimated_document_count()
+    total_users = await db.users.estimated_document_count()
+    matched_agents = await db.zinnia_agents.count_documents({"atlas_user_id": {"$exists": True}})
+    matched_production = await db.zinnia_production.count_documents({"atlas_user_id": {"$exists": True}})
+
+    # Show NPN comparison: Atlas users vs SmartOffice agents
+    npn_comparison = []
+    for u in sample_users:
+        raw = (u.get("npn") or "").strip()
+        npn_comparison.append({
+            "source": "atlas_user",
+            "name": u.get("name", ""),
+            "npn_raw": raw,
+            "npn_normalized": normalize_npn(raw),
+        })
+    for a in sample_agents:
+        raw = (a.get("npn") or "").strip()
+        npn_comparison.append({
+            "source": "smartoffice_agent",
+            "name": f"{a.get('first_name', '')} {a.get('last_name', '')}",
+            "npn_raw": raw,
+            "npn_normalized": normalize_npn(raw),
+        })
+
+    return {
+        "counts": {
+            "zinnia_production": total_production,
+            "zinnia_agents": total_agents,
+            "atlas_users": total_users,
+            "matched_agents": matched_agents,
+            "matched_production": matched_production,
+        },
+        "sample_production": sample_production,
+        "sample_agents": sample_agents,
+        "sample_users": sample_users,
+        "sample_clients": sample_clients,
+        "npn_comparison": npn_comparison,
+    }
+
+
+@api_router.delete("/admin/clear-zinnia")
+async def clear_zinnia_collections():
+    """TEMPORARY - delete after use"""
+    results = {}
+    for collection in ["zinnia_agents", "zinnia_production", "zinnia_cases", 
+                        "zinnia_sync_logs", "zinnia_sync_state", "zinnia_unmatched"]:
+        result = await db[collection].delete_many({})
+        results[collection] = result.deleted_count
+    return {"status": "done", "deleted": results}
 
 # Include router and middleware AFTER all routes are defined
 app.include_router(api_router)

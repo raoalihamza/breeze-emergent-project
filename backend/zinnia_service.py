@@ -74,6 +74,22 @@ MAX_RETRIES = 3
 PAGE_SIZE = 100
 PAGE_DELAY = 0.3  # seconds between API pages
 
+# SmartOffice PolicyStatus numeric codes → human-readable text
+POLICY_STATUS_MAP = {
+    "1": "Active",
+    "2": "Pending",
+    "3": "Issued",
+    "4": "Lapsed",
+    "5": "Paid",
+    "6": "Declined",
+    "7": "Cancelled",
+    "8": "Pending",
+    "9": "Terminated",
+    "10": "Withdrawn",
+    "11": "Not Taken",
+    "12": "Replaced",
+}
+
 
 def set_db(database):
     """Set MongoDB database instance from server.py"""
@@ -82,6 +98,23 @@ def set_db(database):
 
 
 # ─── Data Normalization Utilities ─────────────────────────────────────────────
+
+def normalize_npn(npn: str) -> str:
+    """Normalize NPN for matching — strip 'NPN' prefix, whitespace, leading zeros.
+    Examples: 'NPN052154' -> '52154', '052154' -> '52154', '52154' -> '52154'
+    """
+    if not npn or not npn.strip():
+        return ""
+    # Strip whitespace and common prefixes
+    cleaned = npn.strip().upper()
+    for prefix in ("NPN", "NPN#", "NPN:", "NPN-"):
+        if cleaned.startswith(prefix):
+            cleaned = cleaned[len(prefix):]
+    # Keep only digits
+    digits = re.sub(r"\D", "", cleaned)
+    # Strip leading zeros
+    return digits.lstrip("0") or digits
+
 
 def normalize_name(name: str) -> str:
     """Capitalize name properly: 'john doe' -> 'John Doe'"""
@@ -168,14 +201,18 @@ async def run_agent_matching(limit: int = 0) -> dict:
     # ── Load all Atlas users into memory once ────────────────────────────────
     all_users = await db.users.find({}, {"_id": 0}).to_list(None)
 
-    npn_lookup: dict = {}
+    npn_lookup: dict = {}       # normalized_npn → user
+    npn_raw_lookup: dict = {}   # raw npn → user (for exact match fallback)
     name_lookup: dict = {}
     name_list: list = []  # [(normalized_full_name, user), ...] for fuzzy
 
     for u in all_users:
-        npn = (u.get("npn") or "").strip()
-        if npn:
-            npn_lookup[npn] = u
+        raw_npn = (u.get("npn") or "").strip()
+        if raw_npn:
+            npn_raw_lookup[raw_npn] = u
+            norm = normalize_npn(raw_npn)
+            if norm:
+                npn_lookup[norm] = u
 
         raw = (u.get("name") or "").strip().lower()
         parts = raw.split()
@@ -183,6 +220,11 @@ async def run_agent_matching(limit: int = 0) -> dict:
             key = f"{parts[0]} {parts[-1]}"
             name_lookup[key] = u
             name_list.append((raw, u))
+
+    logger.info(
+        f"Agent matching: {len(all_users)} Atlas users loaded, "
+        f"{len(npn_lookup)} with NPN, {len(name_lookup)} with name"
+    )
 
     # ── Stream zinnia_agents via cursor, process in batches ──────────────────
     matched_npn = 0
@@ -203,19 +245,28 @@ async def run_agent_matching(limit: int = 0) -> dict:
 
     async for agent in query:
         so_id = agent.get("smartoffice_id", "")
-        npn = (agent.get("npn") or "").strip()
+        raw_npn = (agent.get("npn") or "").strip()
+        norm_npn = normalize_npn(raw_npn)
         first = (agent.get("first_name") or "").strip().lower()
         last = (agent.get("last_name") or "").strip().lower()
         name_key = f"{first} {last}" if first and last else ""
 
         matched = False
 
-        # NPN match
-        if npn and npn in npn_lookup:
-            user = npn_lookup[npn]
+        # NPN match (normalized — handles "NPN052154" vs "052154" vs "52154")
+        if norm_npn and norm_npn in npn_lookup:
+            user = npn_lookup[norm_npn]
             agent_updates.append(UpdateOne(
                 {"smartoffice_id": so_id},
                 {"$set": {"atlas_user_id": user.get("id"), "match_type": "npn", "matched_at": now_ts}}
+            ))
+            matched_npn += 1
+            matched = True
+        elif raw_npn and raw_npn in npn_raw_lookup:
+            user = npn_raw_lookup[raw_npn]
+            agent_updates.append(UpdateOne(
+                {"smartoffice_id": so_id},
+                {"$set": {"atlas_user_id": user.get("id"), "match_type": "npn_raw", "matched_at": now_ts}}
             ))
             matched_npn += 1
             matched = True
@@ -252,13 +303,13 @@ async def run_agent_matching(limit: int = 0) -> dict:
                 matched = True
 
         if not matched:
-            reason_parts = ["no_npn" if not npn else "npn_not_found"]
+            reason_parts = ["no_npn" if not raw_npn else "npn_not_found"]
             reason_parts.append("name_not_matched" if name_key else "no_name")
             unmatched_inserts.append({
                 "smartoffice_id": so_id,
                 "first_name": agent.get("first_name", ""),
                 "last_name": agent.get("last_name", ""),
-                "npn": npn,
+                "npn": raw_npn,
                 "contact_type": agent.get("contact_type", ""),
                 "reason": ", ".join(reason_parts),
                 "reviewed": False,
@@ -368,7 +419,11 @@ def build_agent_search_xml(page: int = 0, pagesize: int = 100, searchid: str = "
 
 
 def build_production_search_xml(page: int = 0, pagesize: int = 100, searchid: str = "") -> str:
-    """Build XML request to fetch production/policy data"""
+    """Build XML request to fetch production/policy data.
+    WritingNumber / AgentNumber / ProducerNumber / OwnerContactID are confirmed valid
+    fields (return UNKNOWN in sandbox but may contain agent NPN in production data).
+    PolicyStatus returns numeric status code (3=Submitted, 4=Issued, etc.).
+    """
     return f"""<?xml version="1.0"?>
 <request version="1.0">
     <header>
@@ -384,6 +439,7 @@ def build_production_search_xml(page: int = 0, pagesize: int = 100, searchid: st
                 <CarrierName/>
                 <AnnualPremium/>
                 <InsuredName/>
+                <PolicyStatus/>
             </Policy>
         </object>
     </search>
@@ -526,7 +582,11 @@ def parse_agents(xml_root: ET.Element) -> list:
 
 
 def parse_production(xml_root: ET.Element) -> list:
-    """Parse production/policy XML response into list of dicts"""
+    """Parse production/policy XML response into list of dicts.
+    Only requests confirmed valid fields: PolicyNumber, CarrierName,
+    AnnualPremium, InsuredName, PolicyStatus.
+    PolicyStatus is a numeric code mapped via POLICY_STATUS_MAP.
+    """
     policies = []
     try:
         search_elem = _find_search_element(xml_root)
@@ -539,6 +599,10 @@ def parse_production(xml_root: ET.Element) -> list:
             if not smartoffice_id:
                 continue
 
+            # PolicyStatus: numeric code → human text
+            raw_status = policy.findtext("PolicyStatus", "").strip()
+            status_text = POLICY_STATUS_MAP.get(raw_status, raw_status) if raw_status else ""
+
             policies.append({
                 "smartoffice_id": smartoffice_id,
                 "smartoffice_raw_id": raw_id,
@@ -546,6 +610,8 @@ def parse_production(xml_root: ET.Element) -> list:
                 "carrier_name": normalize_name(policy.findtext("CarrierName", "")),
                 "annual_premium": policy.findtext("AnnualPremium", "0").strip(),
                 "insured_name": normalize_name(policy.findtext("InsuredName", "")),
+                "policy_status_code": raw_status,
+                "status": status_text,
                 "synced_at": datetime.now(timezone.utc).isoformat(),
                 "source": "smartoffice"
             })
@@ -821,18 +887,137 @@ async def sync_agents() -> dict:
     return result
 
 
+async def link_production_to_agents() -> dict:
+    """Link zinnia_production records to Atlas agents via clients collection.
+    Strategy 1 (priority): exact match by policy_number → clients.agent_id
+    Strategy 2 (fallback): fuzzy match insured_name vs clients first+last name (threshold 0.85)
+    Sets: atlas_agent_id, atlas_agent_name, match_method
+    """
+    if db is None:
+        return {"error": "Database not initialized"}
+
+    now_ts = datetime.now(timezone.utc).isoformat()
+
+    # ── Load all clients into memory once ────────────────────────────────────
+    client_by_policy: dict = {}   # policy_number → client doc
+    client_name_list: list = []   # [(full_name_lower, client_doc), ...]
+
+    async for c in db.clients.find(
+        {},
+        {"_id": 0, "policy_number": 1, "agent_id": 1, "agent_name": 1,
+         "first_name": 1, "last_name": 1}
+    ):
+        pn = (c.get("policy_number") or "").strip()
+        if pn:
+            client_by_policy[pn] = c
+
+        fn = (c.get("first_name") or "").strip().lower()
+        ln = (c.get("last_name") or "").strip().lower()
+        if fn and ln:
+            client_name_list.append((f"{fn} {ln}", c))
+
+    logger.info(
+        f"Production linking: {len(client_by_policy)} clients by policy#, "
+        f"{len(client_name_list)} clients by name"
+    )
+
+    total = 0
+    matched_policy_number = 0
+    matched_name_fuzzy = 0
+    unmatched = 0
+
+    BATCH_SIZE = 500
+    updates: list = []
+
+    async for policy in db.zinnia_production.find({}, {"_id": 0}):
+        total += 1
+        so_id = policy.get("smartoffice_id", "")
+        policy_num = (policy.get("policy_number") or "").strip()
+        insured = (policy.get("insured_name") or "").strip().lower()
+
+        atlas_agent_id = None
+        atlas_agent_name = ""
+        match_method = ""
+
+        # ── Strategy 1: exact match by policy_number ──────────────────────
+        if policy_num and policy_num in client_by_policy:
+            client = client_by_policy[policy_num]
+            atlas_agent_id = client.get("agent_id")
+            atlas_agent_name = client.get("agent_name", "")
+            match_method = "policy_number"
+            matched_policy_number += 1
+
+        # ── Strategy 2: fuzzy match by insured_name ───────────────────────
+        if not atlas_agent_id and insured and client_name_list:
+            best_ratio = 0.0
+            best_client = None
+            for candidate_name, candidate_client in client_name_list:
+                ratio = SequenceMatcher(None, insured, candidate_name).ratio()
+                if ratio > best_ratio:
+                    best_ratio = ratio
+                    best_client = candidate_client
+            if best_client and best_ratio >= FUZZY_MATCH_THRESHOLD:
+                atlas_agent_id = best_client.get("agent_id")
+                atlas_agent_name = best_client.get("agent_name", "")
+                match_method = "insured_name_fuzzy"
+                matched_name_fuzzy += 1
+
+        if atlas_agent_id:
+            updates.append(UpdateOne(
+                {"smartoffice_id": so_id},
+                {"$set": {
+                    "atlas_agent_id": atlas_agent_id,
+                    "atlas_agent_name": atlas_agent_name,
+                    "match_method": match_method,
+                    "linked_at": now_ts,
+                }}
+            ))
+        else:
+            unmatched += 1
+
+        if len(updates) >= BATCH_SIZE:
+            await db.zinnia_production.bulk_write(updates, ordered=False)
+            updates = []
+
+    if updates:
+        await db.zinnia_production.bulk_write(updates, ordered=False)
+
+    result = {
+        "total": total,
+        "matched_policy_number": matched_policy_number,
+        "matched_name_fuzzy": matched_name_fuzzy,
+        "unmatched": unmatched,
+    }
+
+    await log_sync("production_linking", "success", result)
+    logger.info(
+        f"Production linking complete: policy#:{matched_policy_number}, "
+        f"name_fuzzy:{matched_name_fuzzy}, unmatched:{unmatched} of {total}"
+    )
+    return result
+
+
 async def sync_production() -> dict:
     """Pull ALL production data from SmartOffice with pagination and save to MongoDB"""
     if _sync_locks["production"].locked():
         return {"status": "already_running", "message": "Production sync is already in progress"}
 
     async with _sync_locks["production"]:
-        return await _paginated_sync(
+        result = await _paginated_sync(
             sync_type="production",
             build_xml_fn=build_production_search_xml,
             parse_fn=parse_production,
             collection_name="zinnia_production",
         )
+
+    # After sync, link policies to Atlas agents in background
+    if result.get("status") == "success":
+        task = asyncio.create_task(link_production_to_agents())
+        _background_tasks["production_linking"] = task
+        result["linking"] = {"status": "started", "message": "Production linking running in background"}
+        logger.info("Production sync complete — linking started in background (lock released)")
+
+    return result
 
 
 async def sync_case_status() -> dict:
